@@ -53,10 +53,5 @@ jobs:
             Custom Windows CPU wheel for llama-cpp-python.
 
             Build settings:
-            - Python 3.9 x64
-            - GGML_NATIVE=OFF
-            - GGML_BLAS=OFF
-            - GGML_OPENMP=OFF
-            - GGML_AVX512=OFF
-            - Conservative CPU build for compatibility testing.
+            ${{env.CMAKE_ARGS}}
           files: wheelhouse/*.whl
