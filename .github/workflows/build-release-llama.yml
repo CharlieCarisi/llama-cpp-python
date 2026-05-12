@@ -1,0 +1,62 @@
+name: Build and Release llama-cpp-python Wheel
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "llama-cpp-python version"
+        required: true
+        default: "0.3.23"
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build-release:
+    runs-on: windows-2022
+
+    steps:
+      - name: Set up Python 3.9 x64
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+          architecture: "x64"
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade "pip<26" setuptools wheel cmake ninja scikit-build-core
+
+      - name: Build conservative CPU wheel
+        shell: pwsh
+        run: |
+          $version = "${{ github.event.inputs.version }}"
+          $env:CMAKE_ARGS = "-DGGML_NATIVE=OFF -DGGML_BLAS=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_AVX512=OFF -DGGML_OPENMP=OFF -DCMAKE_CXX_STANDARD=17"
+          $env:FORCE_CMAKE = "1"
+          python -m pip wheel "llama-cpp-python==$version" --no-cache-dir --no-deps -w wheelhouse -v
+
+      - name: Create release tag
+        shell: pwsh
+        run: |
+          $version = "${{ github.event.inputs.version }}"
+          $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+          "RELEASE_TAG=llama-cpp-python-$version-win-py39-$timestamp" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
+          body: |
+            Custom Windows CPU wheel for llama-cpp-python.
+
+            Build settings:
+            - Python 3.9 x64
+            - GGML_NATIVE=OFF
+            - GGML_BLAS=OFF
+            - GGML_OPENMP=OFF
+            - GGML_AVX512=OFF
+            - Conservative CPU build for compatibility testing.
+          files: wheelhouse/*.whl
