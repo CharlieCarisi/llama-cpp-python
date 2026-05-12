@@ -1,7 +1,10 @@
-name: Build llama-cpp-python Windows Wheel
+name: Build patched llama-cpp-python 0.3.2 Windows Wheel
 
 on:
   workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build:
@@ -16,17 +19,58 @@ jobs:
 
       - name: Install build tools
         run: |
-          python -m pip install --upgrade pip setuptools wheel cmake ninja
+          python -m pip install --upgrade pip setuptools wheel cmake ninja scikit-build
+
+      - name: Download source
+        run: |
+          mkdir source
+          python -m pip download llama-cpp-python==0.3.2 --no-binary=:all: --no-deps -d source
+
+      - name: Extract and patch source
+        shell: pwsh
+        run: |
+          python - <<'PY'
+          import tarfile
+          from pathlib import Path
+
+          tgz = next(Path("source").glob("llama_cpp_python-0.3.2*.tar.gz"))
+          with tarfile.open(tgz, "r:gz") as t:
+              t.extractall("source")
+
+          root = next(Path("source").glob("llama_cpp_python-0.3.2*"))
+
+          files = [
+              root / "vendor" / "llama.cpp" / "common" / "common.cpp",
+              root / "vendor" / "llama.cpp" / "common" / "log.cpp",
+          ]
+
+          for file in files:
+              text = file.read_text(encoding="utf-8", errors="ignore")
+              if "#include <chrono>" not in text:
+                  text = "#include <chrono>\n" + text
+                  file.write_text(text, encoding="utf-8")
+                  print("Patched", file)
+              else:
+                  print("Already has chrono:", file)
+
+          print("SOURCE_ROOT=" + str(root))
+          PY
 
       - name: Build conservative CPU wheel
         shell: pwsh
         run: |
-          $env:CMAKE_ARGS = "-DGGML_NATIVE=OFF -DGGML_BLAS=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_AVX512=OFF -DLLAMA_NATIVE=OFF -DLLAMA_BLAS=OFF -DLLAMA_AVX=ON -DLLAMA_AVX2=ON -DLLAMA_FMA=ON -DLLAMA_F16C=ON -DLLAMA_AVX512=OFF"
+          $src = Get-ChildItem source -Directory | Where-Object { $_.Name -like "llama_cpp_python-0.3.2*" } | Select-Object -First 1
+          $env:CMAKE_ARGS = "-DGGML_NATIVE=OFF -DGGML_BLAS=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_AVX512=OFF -DLLAMA_NATIVE=OFF -DLLAMA_BLAS=OFF -DLLAMA_AVX=ON -DLLAMA_AVX2=ON -DLLAMA_FMA=ON -DLLAMA_F16C=ON -DLLAMA_AVX512=OFF -DCMAKE_CXX_STANDARD=17"
           $env:FORCE_CMAKE = "1"
-          python -m pip wheel llama-cpp-python==0.3.2 --no-cache-dir --no-deps -w wheelhouse -v
+          python -m pip wheel $src.FullName --no-deps -w wheelhouse -v
+
+      - name: Show wheel
+        shell: pwsh
+        run: |
+          Get-ChildItem wheelhouse
 
       - name: Upload wheel
         uses: actions/upload-artifact@v4
         with:
-          name: llama-cpp-python-0.3.2-windows-py39-cpu
+          name: llama-cpp-python-0.3.2-windows-py39-cpu-patched
           path: wheelhouse/*.whl
