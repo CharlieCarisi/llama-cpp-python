@@ -53,5 +53,5 @@ jobs:
             Custom Windows CPU wheel for llama-cpp-python.
 
             Build settings:
-            ${{env.CMAKE_ARGS}}
+            ${{ env.CMAKE_ARGS }}
           files: wheelhouse/*.whl
