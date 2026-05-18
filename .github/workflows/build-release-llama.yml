@@ -41,63 +41,58 @@ jobs:
           $version = "${{ github.event.inputs.version }}"
           New-Item -ItemType Directory -Force -Path src | Out-Null
           python -m pip download "llama-cpp-python==$version" --no-binary=:all: --no-deps -d src
-
-          $tar = Get-ChildItem src -Filter "llama_cpp_python-*.tar.gz" | Select-Object -First 1
-          if (-not $tar) {
-            throw "Could not find source tar.gz for llama-cpp-python $version"
-          }
-
-          python - <<'PY'
+      
+          @'
           import tarfile
           from pathlib import Path
-
+      
           src = Path("src")
           tgz = next(src.glob("llama_cpp_python-*.tar.gz"))
-
+      
           with tarfile.open(tgz, "r:gz") as t:
               t.extractall(src)
-
+      
           roots = [
               p for p in src.iterdir()
               if p.is_dir() and p.name.startswith("llama_cpp_python")
           ]
-
+      
           if not roots:
               raise RuntimeError("Extracted source folder not found")
-
+      
           Path("SOURCE_ROOT.txt").write_text(str(roots[0]), encoding="utf-8")
           print("Source root:", roots[0])
-          PY
-
-      - name: Patch source if needed
-        shell: pwsh
-        run: |
-          $sourceRoot = Get-Content SOURCE_ROOT.txt
-
-          @'
-          from pathlib import Path
-
-          root = Path("SOURCE_ROOT.txt").read_text(encoding="utf-8").strip()
-          root = Path(root)
-
-          files = [
-              root / "vendor" / "llama.cpp" / "common" / "log.cpp",
-              root / "vendor" / "llama.cpp" / "common" / "common.cpp",
-          ]
-
-          for file in files:
-              if not file.exists():
-                  print("Missing, skipped:", file)
-                  continue
-
-              text = file.read_text(encoding="utf-8", errors="ignore")
-
-              if "std::chrono" in text and "#include <chrono>" not in text:
-                  file.write_text("#include <chrono>\n" + text, encoding="utf-8")
-                  print("Patched <chrono>:", file)
-              else:
-                  print("No chrono patch needed:", file)
           '@ | python
+      
+            - name: Patch source if needed
+              shell: pwsh
+              run: |
+                $sourceRoot = Get-Content SOURCE_ROOT.txt
+      
+                @'
+                from pathlib import Path
+      
+                root = Path("SOURCE_ROOT.txt").read_text(encoding="utf-8").strip()
+                root = Path(root)
+      
+                files = [
+                    root / "vendor" / "llama.cpp" / "common" / "log.cpp",
+                    root / "vendor" / "llama.cpp" / "common" / "common.cpp",
+                ]
+      
+                for file in files:
+                    if not file.exists():
+                        print("Missing, skipped:", file)
+                        continue
+      
+                    text = file.read_text(encoding="utf-8", errors="ignore")
+      
+                    if "std::chrono" in text and "#include <chrono>" not in text:
+                        file.write_text("#include <chrono>\n" + text, encoding="utf-8")
+                        print("Patched <chrono>:", file)
+                    else:
+                        print("No chrono patch needed:", file)
+                '@ | python
 
       - name: Build wheel with cibuildwheel
         shell: pwsh
