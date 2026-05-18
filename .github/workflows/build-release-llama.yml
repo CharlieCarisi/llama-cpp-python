@@ -20,7 +20,7 @@ env:
 
 jobs:
   build-release:
-    runs-on: windows-2019
+    runs-on: windows-2022
 
     steps:
       - name: Set up Python 3.9
