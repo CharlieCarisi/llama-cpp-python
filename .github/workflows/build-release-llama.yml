@@ -64,35 +64,35 @@ jobs:
           print("Source root:", roots[0])
           '@ | python
       
-            - name: Patch source if needed
-              shell: pwsh
-              run: |
-                $sourceRoot = Get-Content SOURCE_ROOT.txt
-      
-                @'
-                from pathlib import Path
-      
-                root = Path("SOURCE_ROOT.txt").read_text(encoding="utf-8").strip()
-                root = Path(root)
-      
-                files = [
-                    root / "vendor" / "llama.cpp" / "common" / "log.cpp",
-                    root / "vendor" / "llama.cpp" / "common" / "common.cpp",
-                ]
-      
-                for file in files:
-                    if not file.exists():
-                        print("Missing, skipped:", file)
-                        continue
-      
-                    text = file.read_text(encoding="utf-8", errors="ignore")
-      
-                    if "std::chrono" in text and "#include <chrono>" not in text:
-                        file.write_text("#include <chrono>\n" + text, encoding="utf-8")
-                        print("Patched <chrono>:", file)
-                    else:
-                        print("No chrono patch needed:", file)
-                '@ | python
+      - name: Patch source if needed
+        shell: pwsh
+        run: |
+          $sourceRoot = Get-Content SOURCE_ROOT.txt
+
+          @'
+          from pathlib import Path
+
+          root = Path("SOURCE_ROOT.txt").read_text(encoding="utf-8").strip()
+          root = Path(root)
+
+          files = [
+              root / "vendor" / "llama.cpp" / "common" / "log.cpp",
+              root / "vendor" / "llama.cpp" / "common" / "common.cpp",
+          ]
+
+          for file in files:
+              if not file.exists():
+                  print("Missing, skipped:", file)
+                  continue
+
+              text = file.read_text(encoding="utf-8", errors="ignore")
+
+              if "std::chrono" in text and "#include <chrono>" not in text:
+                  file.write_text("#include <chrono>\n" + text, encoding="utf-8")
+                  print("Patched <chrono>:", file)
+              else:
+                  print("No chrono patch needed:", file)
+          '@ | python
 
       - name: Build wheel with cibuildwheel
         shell: pwsh
