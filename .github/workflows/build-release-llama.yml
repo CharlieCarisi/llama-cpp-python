@@ -63,31 +63,47 @@ jobs:
           cd src
           python -m uv pip install -e .[all] --verbose
 
-      - name: Patch source if needed
+      - name: Patch chrono includes robustly
         shell: pwsh
         run: |
           @'
           from pathlib import Path
 
-          root = Path("src")
+          root = Path("src") / "vendor" / "llama.cpp"
 
-          files = [
-              root / "vendor" / "llama.cpp" / "common" / "log.cpp",
-              root / "vendor" / "llama.cpp" / "common" / "common.cpp",
-          ]
+          if not root.exists():
+              raise RuntimeError(f"Could not find llama.cpp source at {root}")
 
-          for file in files:
-              if not file.exists():
-                  print("Missing, skipped:", file)
-                  continue
+          patched = []
 
+          for file in list(root.rglob("*.cpp")) + list(root.rglob("*.h")) + list(root.rglob("*.hpp")):
               text = file.read_text(encoding="utf-8", errors="ignore")
 
-              if "std::chrono" in text and "#include <chrono>" not in text:
-                  file.write_text("#include <chrono>\n" + text, encoding="utf-8")
-                  print("Patched <chrono>:", file)
+              if "std::chrono" not in text:
+                  continue
+
+              if "#include <chrono>" in text:
+                  print("Already has <chrono>:", file)
+                  continue
+
+              file.write_text("#include <chrono>\n" + text, encoding="utf-8")
+              patched.append(str(file))
+              print("Patched <chrono>:", file)
+
+          print("Total chrono patches:", len(patched))
+
+          log_cpp = root / "common" / "log.cpp"
+          common_cpp = root / "common" / "common.cpp"
+
+          for file in [log_cpp, common_cpp]:
+              print("=" * 80)
+              print(file)
+              if file.exists():
+                  lines = file.read_text(encoding="utf-8", errors="ignore").splitlines()
+                  for i, line in enumerate(lines[:25], 1):
+                      print(f"{i:03d}: {line}")
               else:
-                  print("No chrono patch needed:", file)
+                  print("MISSING")
           '@ | python
 
       - name: Set cibuildwheel environment
@@ -195,4 +211,5 @@ jobs:
             - `official_like` uses no explicit CMake args except FORCE_CMAKE=1.
             - `no_openmp` disables OpenMP and BLAS.
             - `safe` disables most CPU/backend variants.
+            - Chrono patch is applied to any llama.cpp source file using `std::chrono` without `<chrono>`.
           files: wheelhouse/*.whl
