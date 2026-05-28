@@ -63,47 +63,71 @@ jobs:
           cd src
           python -m uv pip install -e .[all] --verbose
 
-      - name: Patch chrono includes robustly
+      - name: Patch chrono/log.cpp for MSVC
         shell: pwsh
         run: |
           @'
           from pathlib import Path
 
           root = Path("src") / "vendor" / "llama.cpp"
+          log_cpp = root / "common" / "log.cpp"
+          common_cpp = root / "common" / "common.cpp"
 
           if not root.exists():
               raise RuntimeError(f"Could not find llama.cpp source at {root}")
 
-          patched = []
+          if not log_cpp.exists():
+              raise RuntimeError(f"Missing expected file: {log_cpp}")
 
+          def patch_file(file: Path):
+              text = file.read_text(encoding="utf-8", errors="ignore")
+              original = text
+
+              # Ensure chrono header is present.
+              if "#include <chrono>" not in text:
+                  text = "#include <chrono>\n" + text
+
+              # Some older vendored llama.cpp sources have chrono usage that MSVC rejects.
+              # Make the clock explicit.
+              text = text.replace("std::chrono::now()", "std::chrono::system_clock::now()")
+              text = text.replace("std::chrono::high_resolution_clock::now()", "std::chrono::system_clock::now()")
+
+              if text != original:
+                  file.write_text(text, encoding="utf-8")
+                  print("Patched:", file)
+              else:
+                  print("No change:", file)
+
+          patch_file(log_cpp)
+
+          if common_cpp.exists():
+              patch_file(common_cpp)
+
+          # Extra pass: add <chrono> to any llama.cpp source file that uses std::chrono.
+          patched_extra = []
           for file in list(root.rglob("*.cpp")) + list(root.rglob("*.h")) + list(root.rglob("*.hpp")):
               text = file.read_text(encoding="utf-8", errors="ignore")
-
               if "std::chrono" not in text:
                   continue
-
               if "#include <chrono>" in text:
-                  print("Already has <chrono>:", file)
                   continue
-
               file.write_text("#include <chrono>\n" + text, encoding="utf-8")
-              patched.append(str(file))
-              print("Patched <chrono>:", file)
+              patched_extra.append(str(file))
+              print("Extra chrono patch:", file)
 
-          print("Total chrono patches:", len(patched))
+          print("Extra chrono patches:", len(patched_extra))
 
-          log_cpp = root / "common" / "log.cpp"
-          common_cpp = root / "common" / "common.cpp"
+          print("=" * 80)
+          print("VERIFY log.cpp")
+          lines = log_cpp.read_text(encoding="utf-8", errors="ignore").splitlines()
+          for i, line in enumerate(lines[:80], 1):
+              print(f"{i:03d}: {line}")
 
-          for file in [log_cpp, common_cpp]:
-              print("=" * 80)
-              print(file)
-              if file.exists():
-                  lines = file.read_text(encoding="utf-8", errors="ignore").splitlines()
-                  for i, line in enumerate(lines[:25], 1):
-                      print(f"{i:03d}: {line}")
-              else:
-                  print("MISSING")
+          text = log_cpp.read_text(encoding="utf-8", errors="ignore")
+          if "std::chrono::now()" in text:
+              raise RuntimeError("Patch failed: std::chrono::now() still exists in log.cpp")
+          if "#include <chrono>" not in text:
+              raise RuntimeError("Patch failed: #include <chrono> missing from log.cpp")
           '@ | python
 
       - name: Set cibuildwheel environment
@@ -211,5 +235,5 @@ jobs:
             - `official_like` uses no explicit CMake args except FORCE_CMAKE=1.
             - `no_openmp` disables OpenMP and BLAS.
             - `safe` disables most CPU/backend variants.
-            - Chrono patch is applied to any llama.cpp source file using `std::chrono` without `<chrono>`.
+            - `log.cpp` is patched for MSVC chrono compatibility before build.
           files: wheelhouse/*.whl
