@@ -10,7 +10,7 @@ on:
       release_suffix:
         description: "Optional release suffix"
         required: true
-        default: "test"
+        default: "git-checkout-test"
 
 permissions:
   contents: write
@@ -20,7 +20,7 @@ env:
 
 jobs:
   build-release:
-    runs-on: windows-2022
+    runs-on: windows-2019
 
     steps:
       - name: Set up Python 3.9
@@ -33,47 +33,30 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --upgrade "pip<26" setuptools wheel
-          python -m pip install cibuildwheel==2.21.1 build
+          python -m pip install cibuildwheel==2.21.1 build uv
 
-      - name: Download source
+      - name: Clone llama-cpp-python source at tag
         shell: pwsh
         run: |
           $version = "${{ github.event.inputs.version }}"
-          New-Item -ItemType Directory -Force -Path src | Out-Null
-          python -m pip download "llama-cpp-python==$version" --no-binary=:all: --no-deps -d src
-      
-          @'
-          import tarfile
-          from pathlib import Path
-      
-          src = Path("src")
-          tgz = next(src.glob("llama_cpp_python-*.tar.gz"))
-      
-          with tarfile.open(tgz, "r:gz") as t:
-              t.extractall(src)
-      
-          roots = [
-              p for p in src.iterdir()
-              if p.is_dir() and p.name.startswith("llama_cpp_python")
-          ]
-      
-          if not roots:
-              raise RuntimeError("Extracted source folder not found")
-      
-          Path("SOURCE_ROOT.txt").write_text(str(roots[0]), encoding="utf-8")
-          print("Source root:", roots[0])
-          '@ | python
-      
+          $tag = "v$version"
+
+          git clone --recursive https://github.com/abetlen/llama-cpp-python.git src
+          cd src
+          git fetch --tags
+          git checkout $tag
+          git submodule update --init --recursive
+
+          git rev-parse HEAD
+          git submodule status
+
       - name: Patch source if needed
         shell: pwsh
         run: |
-          $sourceRoot = Get-Content SOURCE_ROOT.txt
-
           @'
           from pathlib import Path
 
-          root = Path("SOURCE_ROOT.txt").read_text(encoding="utf-8").strip()
-          root = Path(root)
+          root = Path("src")
 
           files = [
               root / "vendor" / "llama.cpp" / "common" / "log.cpp",
@@ -94,22 +77,21 @@ jobs:
                   print("No chrono patch needed:", file)
           '@ | python
 
-      - name: Build wheel with cibuildwheel
+      - name: Build Windows cp39 wheel using cibuildwheel
         shell: pwsh
         run: |
-          $sourceRoot = Get-Content SOURCE_ROOT.txt
-
           $env:CIBW_BUILD = "cp39-win_amd64"
           $env:CIBW_SKIP = "*musllinux* pp*"
           $env:CIBW_REPAIR_WHEEL_COMMAND = ""
           $env:CIBW_BUILD_VERBOSITY = "1"
 
-          python -m cibuildwheel $sourceRoot --output-dir wheelhouse
+          python -m cibuildwheel src --output-dir wheelhouse
 
       - name: Show wheels
         shell: pwsh
         run: |
           Get-ChildItem wheelhouse
+          Get-ChildItem wheelhouse | Select-Object Name, Length, LastWriteTime
 
       - name: Create release tag
         shell: pwsh
@@ -127,7 +109,11 @@ jobs:
           body: |
             Custom Windows cp39 wheel for llama-cpp-python.
 
-            Built from PyPI source tarball.
+            Build method:
+            - Cloned official llama-cpp-python GitHub repository.
+            - Checked out version tag.
+            - Initialized submodules recursively.
+            - Built with cibuildwheel.
 
             Version:
             - llama-cpp-python: ${{ github.event.inputs.version }}
@@ -135,7 +121,5 @@ jobs:
             - Runner: windows-2019
             - Builder: cibuildwheel 2.21.1
 
-            Notes:
-            - Source is downloaded at workflow runtime.
-            - Adds missing `<chrono>` include only if needed.
+            This should be closer to the official wheel build path than building from the PyPI source tarball.
           files: wheelhouse/*.whl
