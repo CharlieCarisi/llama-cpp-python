@@ -10,7 +10,7 @@ on:
       release_suffix:
         description: "Release suffix"
         required: true
-        default: "official-style"
+        default: "force-chrono"
       runner:
         description: "Windows runner"
         required: true
@@ -70,58 +70,7 @@ jobs:
           Set-Location src
           python -m uv pip install --system -e ".[all]" --verbose
 
-      - name: Force patch missing chrono includes
-        shell: pwsh
-        run: |
-          @'
-          from pathlib import Path
-          import re
-          import sys
-
-          root = Path("src")
-
-          files = [
-              root / "vendor" / "llama.cpp" / "common" / "common.cpp",
-              root / "vendor" / "llama.cpp" / "common" / "log.cpp",
-          ]
-
-          include_re = re.compile(r'^\s*#\s*include\s*<chrono>\s*$', re.MULTILINE)
-
-          for file in files:
-              if not file.exists():
-                  raise FileNotFoundError(f"Required file missing: {file}")
-
-              text = file.read_text(encoding="utf-8", errors="ignore")
-
-              if not include_re.search(text):
-                  lines = text.splitlines()
-                  insert_at = 0
-
-                  # Insert after leading comments/blank lines and after the first include block begins.
-                  for i, line in enumerate(lines):
-                      if line.strip().startswith("#include"):
-                          insert_at = i + 1
-                          break
-
-                  lines.insert(insert_at, "#include <chrono>")
-                  text = "\n".join(lines) + "\n"
-                  file.write_text(text, encoding="utf-8", newline="\n")
-                  print(f"PATCHED: {file}")
-              else:
-                  print(f"Already has real #include <chrono>: {file}")
-
-              verify = file.read_text(encoding="utf-8", errors="ignore")
-              if not include_re.search(verify):
-                  raise RuntimeError(f"Patch verification failed for {file}")
-
-              print(f"--- First 25 lines of {file} ---")
-              for n, line in enumerate(verify.splitlines()[:25], start=1):
-                  print(f"{n:02d}: {line}")
-
-          print("Chrono patch verification completed successfully.")
-          '@ | python
-
-      - name: Build Windows cp39 wheel with cibuildwheel
+      - name: Build Windows cp39 wheel with forced chrono include
         shell: pwsh
         run: |
           $env:CIBW_BUILD = "cp39-win_amd64"
@@ -129,8 +78,12 @@ jobs:
           $env:CIBW_REPAIR_WHEEL_COMMAND = ""
           $env:CIBW_BUILD_VERBOSITY = "1"
 
-          # Do not set custom CMAKE_ARGS.
-          # We are trying to stay close to the official wheel build path.
+          # This is the important fix:
+          # MSVC reads the CL environment variable and applies it to all cl.exe compilations.
+          # /FIchrono forces #include <chrono> into every compiled translation unit.
+          $env:CIBW_ENVIRONMENT_WINDOWS = 'CL="/FIchrono"'
+
+          # Stay close to the official build path. Do not set custom CMAKE_ARGS.
           Remove-Item Env:CMAKE_ARGS -ErrorAction SilentlyContinue
           Remove-Item Env:FORCE_CMAKE -ErrorAction SilentlyContinue
 
@@ -253,10 +206,9 @@ jobs:
             - Clones official llama-cpp-python repository.
             - Checks out selected version tag.
             - Initializes submodules recursively.
-            - Installs project dependencies with uv.
-            - Force-patches missing `<chrono>` include in common.cpp and log.cpp.
             - Builds cp39-win_amd64 wheel using cibuildwheel.
             - Does not set custom CMAKE_ARGS.
+            - Forces MSVC to include chrono using CL=/FIchrono.
 
             Inputs:
             - llama-cpp-python version: ${{ github.event.inputs.version }}
