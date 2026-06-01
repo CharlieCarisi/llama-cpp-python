@@ -7,14 +7,18 @@ on:
         description: "llama-cpp-python version, e.g. 0.3.2, 0.3.3, 0.3.8"
         required: true
         default: "0.3.2"
-      profile:
-        description: "Build profile: official_like, no_openmp, safe"
-        required: true
-        default: "official_like"
       release_suffix:
-        description: "Optional release suffix"
+        description: "Release suffix"
         required: true
-        default: "test"
+        default: "empty-repo-cibw"
+      runner:
+        description: "Windows runner"
+        required: true
+        default: "windows-2022"
+        type: choice
+        options:
+          - windows-2022
+          - windows-2019
 
 permissions:
   contents: write
@@ -24,7 +28,7 @@ env:
 
 jobs:
   build-release:
-    runs-on: windows-2022
+    runs-on: ${{ github.event.inputs.runner }}
 
     steps:
       - name: Set up Python 3.9 x64
@@ -33,123 +37,68 @@ jobs:
           python-version: "3.9"
           architecture: "x64"
 
-      - name: Install host build tools
+      - name: Install build tools
         shell: pwsh
         run: |
           python -m pip install --upgrade "pip<26" setuptools wheel
-          python -m pip install uv cibuildwheel==2.21.1 build
+          python -m pip install "cibuildwheel==2.21.1" build uv
 
-      - name: Clone llama-cpp-python source
+      - name: Clone official llama-cpp-python source
         shell: pwsh
         run: |
           $version = "${{ github.event.inputs.version }}"
           $tag = "v$version"
 
+          Write-Host "Cloning llama-cpp-python tag $tag"
+
           git clone --recursive https://github.com/abetlen/llama-cpp-python.git src
-          cd src
+
+          Set-Location src
           git fetch --tags
           git checkout $tag
           git submodule update --init --recursive
 
-          Write-Host "Checked out:"
+          Write-Host "Checked out commit:"
           git rev-parse HEAD
 
-          Write-Host "Submodules:"
+          Write-Host "Submodule status:"
           git submodule status
 
-      - name: Install project dependencies like official workflow
+      - name: Install project build dependencies like official workflow
         shell: pwsh
         run: |
-          cd src
-          python -m uv pip install -e .[all] --verbose
+          Set-Location src
 
-      - name: Patch chrono/log.cpp for MSVC
+          # This mirrors the official workflow style more closely than direct pip wheel.
+          # Use --system because GitHub Actions setup-python is already the active Python.
+          python -m uv pip install --system -e ".[all]" --verbose
+
+      - name: Patch source if chrono include is missing
         shell: pwsh
         run: |
           @'
           from pathlib import Path
 
-          root = Path("src") / "vendor" / "llama.cpp"
-          log_cpp = root / "common" / "log.cpp"
-          common_cpp = root / "common" / "common.cpp"
+          root = Path("src")
 
-          if not root.exists():
-              raise RuntimeError(f"Could not find llama.cpp source at {root}")
+          files = [
+              root / "vendor" / "llama.cpp" / "common" / "log.cpp",
+              root / "vendor" / "llama.cpp" / "common" / "common.cpp",
+          ]
 
-          if not log_cpp.exists():
-              raise RuntimeError(f"Missing expected file: {log_cpp}")
+          for file in files:
+              if not file.exists():
+                  print("Missing, skipped:", file)
+                  continue
 
-          def patch_file(file: Path):
               text = file.read_text(encoding="utf-8", errors="ignore")
-              original = text
 
-              # Ensure chrono header is present.
-              if "#include <chrono>" not in text:
-                  text = "#include <chrono>\n" + text
-
-              # Some older vendored llama.cpp sources have chrono usage that MSVC rejects.
-              # Make the clock explicit.
-              text = text.replace("std::chrono::now()", "std::chrono::system_clock::now()")
-              text = text.replace("std::chrono::high_resolution_clock::now()", "std::chrono::system_clock::now()")
-
-              if text != original:
-                  file.write_text(text, encoding="utf-8")
-                  print("Patched:", file)
+              if "std::chrono" in text and "#include <chrono>" not in text:
+                  file.write_text("#include <chrono>\n" + text, encoding="utf-8")
+                  print("Patched missing <chrono>:", file)
               else:
-                  print("No change:", file)
-
-          patch_file(log_cpp)
-
-          if common_cpp.exists():
-              patch_file(common_cpp)
-
-          # Extra pass: add <chrono> to any llama.cpp source file that uses std::chrono.
-          patched_extra = []
-          for file in list(root.rglob("*.cpp")) + list(root.rglob("*.h")) + list(root.rglob("*.hpp")):
-              text = file.read_text(encoding="utf-8", errors="ignore")
-              if "std::chrono" not in text:
-                  continue
-              if "#include <chrono>" in text:
-                  continue
-              file.write_text("#include <chrono>\n" + text, encoding="utf-8")
-              patched_extra.append(str(file))
-              print("Extra chrono patch:", file)
-
-          print("Extra chrono patches:", len(patched_extra))
-
-          print("=" * 80)
-          print("VERIFY log.cpp")
-          lines = log_cpp.read_text(encoding="utf-8", errors="ignore").splitlines()
-          for i, line in enumerate(lines[:80], 1):
-              print(f"{i:03d}: {line}")
-
-          text = log_cpp.read_text(encoding="utf-8", errors="ignore")
-          if "std::chrono::now()" in text:
-              raise RuntimeError("Patch failed: std::chrono::now() still exists in log.cpp")
-          if "#include <chrono>" not in text:
-              raise RuntimeError("Patch failed: #include <chrono> missing from log.cpp")
+                  print("No chrono patch needed:", file)
           '@ | python
-
-      - name: Set cibuildwheel environment
-        shell: pwsh
-        run: |
-          $profile = "${{ github.event.inputs.profile }}"
-
-          if ($profile -eq "official_like") {
-            $cmakeArgs = ""
-          }
-          elseif ($profile -eq "no_openmp") {
-            $cmakeArgs = "-DGGML_OPENMP=OFF -DGGML_BLAS=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF"
-          }
-          elseif ($profile -eq "safe") {
-            $cmakeArgs = "-DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=OFF -DGGML_BACKEND_DL=OFF -DGGML_BLAS=OFF -DGGML_OPENMP=OFF -DGGML_AVX=OFF -DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_F16C=OFF -DGGML_AVX512=OFF -DGGML_CUDA=OFF -DGGML_VULKAN=OFF -DGGML_SYCL=OFF -DGGML_METAL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF"
-          }
-          else {
-            throw "Unknown profile: $profile"
-          }
-
-          "BUILD_PROFILE=$profile" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "CMAKE_ARGS_USED=$cmakeArgs" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Build Windows cp39 wheel with cibuildwheel
         shell: pwsh
@@ -157,53 +106,118 @@ jobs:
           $env:CIBW_BUILD = "cp39-win_amd64"
           $env:CIBW_SKIP = "*musllinux* pp*"
           $env:CIBW_REPAIR_WHEEL_COMMAND = ""
-          $env:CIBW_BUILD_VERBOSITY = "2"
+          $env:CIBW_BUILD_VERBOSITY = "1"
 
-          $cmakeArgs = "${{ env.CMAKE_ARGS_USED }}"
-
-          if ($cmakeArgs -ne "") {
-            $env:CIBW_ENVIRONMENT_WINDOWS = "FORCE_CMAKE=1 CMAKE_ARGS='$cmakeArgs'"
-          }
-          else {
-            $env:CIBW_ENVIRONMENT_WINDOWS = "FORCE_CMAKE=1"
-          }
-
-          Write-Host "Profile: ${{ env.BUILD_PROFILE }}"
-          Write-Host "CIBW_ENVIRONMENT_WINDOWS: $env:CIBW_ENVIRONMENT_WINDOWS"
+          # Important: do not set custom CMAKE_ARGS here.
+          # The goal is to reproduce the official wheel build path as closely as possible.
+          Remove-Item Env:CMAKE_ARGS -ErrorAction SilentlyContinue
+          Remove-Item Env:FORCE_CMAKE -ErrorAction SilentlyContinue
 
           python -m cibuildwheel src --output-dir wheelhouse
 
-      - name: Show wheel and DLL hashes
+      - name: Generate wheel DLL hash report
         shell: pwsh
         run: |
-          Get-ChildItem wheelhouse
+          New-Item -ItemType Directory -Force -Path reports | Out-Null
 
-          New-Item -ItemType Directory -Force -Path inspect | Out-Null
+          @'
+          import zipfile
+          import hashlib
+          from pathlib import Path
+
+          wheels = list(Path("wheelhouse").glob("*.whl"))
+          if not wheels:
+              raise RuntimeError("No wheel found in wheelhouse")
+
+          for wheel in wheels:
+              print("Wheel:", wheel.name)
+              print("Wheel size:", wheel.stat().st_size)
+              print("Wheel sha256:", hashlib.sha256(wheel.read_bytes()).hexdigest())
+              print()
+
+              with zipfile.ZipFile(wheel, "r") as z:
+                  dlls = sorted(
+                      name for name in z.namelist()
+                      if name.lower().endswith(".dll")
+                  )
+
+                  for name in dlls:
+                      data = z.read(name)
+                      print(
+                          Path(name).name,
+                          len(data),
+                          hashlib.sha256(data).hexdigest(),
+                          name,
+                      )
+          '@ | python | Tee-Object reports\wheel_dll_hashes.txt
+
+      - name: Test wheel import and backend init on runner
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          New-Item -ItemType Directory -Force -Path reports | Out-Null
+
           $wheel = Get-ChildItem wheelhouse -Filter "*.whl" | Select-Object -First 1
-          Copy-Item $wheel.FullName inspect\wheel.zip
-          Expand-Archive inspect\wheel.zip -DestinationPath inspect\wheel -Force
 
-          Get-ChildItem inspect\wheel -Recurse -Filter "*.dll" | ForEach-Object {
-            $hash = Get-FileHash $_.FullName -Algorithm SHA256
-            "$($_.Name) $($_.Length) $($hash.Hash.ToLower())"
-          } | Tee-Object -FilePath inspect\dll_hashes.txt
+          python -m venv testenv
+          .\testenv\Scripts\python.exe -m pip install --upgrade "pip<26" setuptools wheel
+          .\testenv\Scripts\python.exe -m pip install "numpy<2" diskcache jinja2 typing-extensions
+          .\testenv\Scripts\python.exe -m pip install --force-reinstall --no-deps $wheel.FullName
 
-          Get-Content inspect\dll_hashes.txt
+          @'
+          import os
+          import sys
+          import platform
+          import traceback
+          from pathlib import Path
 
-      - name: Upload debug artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: dll-hashes-${{ github.event.inputs.version }}-${{ github.event.inputs.profile }}
-          path: inspect/dll_hashes.txt
+          print("Python:", sys.version)
+          print("Platform:", platform.platform())
+
+          import llama_cpp
+          print("llama_cpp version:", getattr(llama_cpp, "__version__", "unknown"))
+          print("llama_cpp file:", llama_cpp.__file__)
+
+          lib = Path(llama_cpp.__file__).resolve().parent / "lib"
+          print("lib:", lib)
+
+          for dll in sorted(lib.glob("*.dll")):
+              print(dll.name, dll.stat().st_size)
+
+          os.add_dll_directory(str(lib))
+
+          from llama_cpp import llama_cpp as lc
+          print("Native module:", lc)
+
+          try:
+              print("Calling llama_backend_init()")
+              lc.llama_backend_init()
+              print("llama_backend_init OK")
+              lc.llama_backend_free()
+              print("llama_backend_free OK")
+          except Exception:
+              print("llama_backend_init FAILED")
+              traceback.print_exc()
+          '@ | .\testenv\Scripts\python.exe | Tee-Object reports\runner_backend_test.txt
+
+      - name: Show build outputs
+        shell: pwsh
+        run: |
+          Write-Host "Wheelhouse:"
+          Get-ChildItem wheelhouse | Format-Table Name, Length, LastWriteTime
+
+          Write-Host "Reports:"
+          Get-ChildItem reports | Format-Table Name, Length, LastWriteTime
 
       - name: Create release tag
         shell: pwsh
         run: |
           $version = "${{ github.event.inputs.version }}"
-          $profile = "${{ github.event.inputs.profile }}"
           $suffix = "${{ github.event.inputs.release_suffix }}"
+          $runner = "${{ github.event.inputs.runner }}"
           $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
-          "RELEASE_TAG=llama-cpp-python-$version-win-cp39-$profile-$suffix-$timestamp" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+          "RELEASE_TAG=llama-cpp-python-$version-cp39-$runner-$suffix-$timestamp" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -215,25 +229,21 @@ jobs:
 
             Build method:
             - Empty repo workflow.
-            - Clones official llama-cpp-python GitHub repository.
+            - Clones official llama-cpp-python repository.
             - Checks out selected version tag.
             - Initializes submodules recursively.
-            - Installs project extras with uv.
-            - Builds with cibuildwheel.
+            - Installs project dependencies with uv.
+            - Builds cp39-win_amd64 wheel using cibuildwheel.
+            - Does not set custom CMAKE_ARGS.
 
-            Version:
-            - llama-cpp-python: ${{ github.event.inputs.version }}
-            - Python ABI: cp39-win_amd64
-            - Runner: windows-2022
-            - Builder: cibuildwheel 2.21.1
-            - Profile: ${{ env.BUILD_PROFILE }}
+            Inputs:
+            - llama-cpp-python version: ${{ github.event.inputs.version }}
+            - runner: ${{ github.event.inputs.runner }}
+            - suffix: ${{ github.event.inputs.release_suffix }}
 
-            CMake args:
-            `${{ env.CMAKE_ARGS_USED }}`
-
-            Notes:
-            - `official_like` uses no explicit CMake args except FORCE_CMAKE=1.
-            - `no_openmp` disables OpenMP and BLAS.
-            - `safe` disables most CPU/backend variants.
-            - `log.cpp` is patched for MSVC chrono compatibility before build.
-          files: wheelhouse/*.whl
+            Included reports:
+            - wheel_dll_hashes.txt
+            - runner_backend_test.txt
+          files: |
+            wheelhouse/*.whl
+            reports/*.txt
