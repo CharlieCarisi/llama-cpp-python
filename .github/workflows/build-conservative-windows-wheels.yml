@@ -113,6 +113,18 @@ jobs:
             $sharedSetting,
             'set(BUILD_SHARED_LIBS "Off")'
           )
+
+          # The upstream package installs runtime DLL dependencies for both
+          # llama and ggml. ggml is static in this build, so CMake rejects
+          # TARGET_RUNTIME_DLLS for that target. Keep the llama rules and
+          # remove only the two now-invalid ggml rules.
+          $ggmlRuntimeInstalls = [regex]'(?ms)\s*install\(\s*FILES \$<TARGET_RUNTIME_DLLS:ggml>\s*DESTINATION [^\r\n]+\s*\)'
+          $ggmlRuntimeInstallMatches = $ggmlRuntimeInstalls.Matches($pythonCmake)
+          if ($ggmlRuntimeInstallMatches.Count -ne 2) {
+            throw "Expected two ggml runtime-DLL install rules, found $($ggmlRuntimeInstallMatches.Count)"
+          }
+          $pythonCmake = $ggmlRuntimeInstalls.Replace($pythonCmake, "")
+
           Set-Content $pythonCmakePath $pythonCmake -Encoding UTF8
 
           $llamaCmakePath = "src\vendor\llama.cpp\src\CMakeLists.txt"
