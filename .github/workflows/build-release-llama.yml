@@ -20,6 +20,14 @@ on:
           - windows-2022
           - windows-2019
 
+
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/build-release-llama.yml"
+      - ".github/workflows/build-conservative-windows-wheels.yml"
+
 permissions:
   contents: write
 
@@ -27,7 +35,14 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  conservative-pr:
+    if: github.event_name == 'pull_request'
+    uses: ./.github/workflows/build-conservative-windows-wheels.yml
+    permissions:
+      contents: read
+
   build-release:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ${{ github.event.inputs.runner }}
 
     steps:
