@@ -42,11 +42,11 @@ env:
 jobs:
   conservative-pr:
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
-    uses: ./.github/workflows/build-conservative-windows-wheels.yml
+    uses: ./.github/workflows/build-init-stage-diagnostics.yml
     with:
       version: "0.3.34"
       publish_release: true
-      release_tag: "v0.3.34-win39-monolithic-r1"
+      release_tag: "v0.3.34-win39-init-diagnostic-r2"
     permissions:
       contents: write
 
