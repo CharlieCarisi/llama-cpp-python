@@ -46,7 +46,7 @@ jobs:
     with:
       version: "0.3.34"
       publish_release: true
-      release_tag: "v0.3.34-win39-init-diagnostic-r2"
+      release_tag: "v0.3.34-win39-ggml-init-diagnostic-r3"
     permissions:
       contents: write
 
