@@ -17,7 +17,7 @@ on:
         description: GitHub release tag
         required: false
         type: string
-        default: "v0.3.34-win39-init-diagnostic-r2"
+        default: "v0.3.34-win39-ggml-init-diagnostic-r3"
   workflow_dispatch:
     inputs:
       version:
@@ -32,7 +32,7 @@ on:
       release_tag:
         description: GitHub release tag
         required: true
-        default: "v0.3.34-win39-init-diagnostic-r2"
+        default: "v0.3.34-win39-ggml-init-diagnostic-r3"
 
 permissions:
   contents: write
@@ -48,15 +48,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - stage: "1"
-            variant: init-stage1-time
-            package_suffix: diag.stage1
-          - stage: "2"
-            variant: init-stage2-context
-            package_suffix: diag.stage2
-          - stage: "3"
-            variant: init-stage3-backends
-            package_suffix: diag.stage3
+          - stage: "4"
+            variant: ggml-init-internal
+            package_suffix: diag.ggml1
 
     env:
       DIAG_STAGE: ${{ matrix.stage }}
@@ -208,6 +202,26 @@ jobs:
           }
           '@
 
+          $stage4 = @'
+          void llama_backend_init(void) {
+              fprintf(stderr, "[init-diag] stage 1: ggml_time_init begin\n");
+              fflush(stderr);
+              ggml_time_init();
+              fprintf(stderr, "[init-diag] stage 1: ggml_time_init ok\n");
+              fflush(stderr);
+
+              fprintf(stderr, "[init-diag] stage 2: ggml_init begin\n");
+              fflush(stderr);
+              struct ggml_init_params params = { 0, NULL, false };
+              struct ggml_context * ctx = ggml_init(params);
+              fprintf(stderr, "[init-diag] stage 2: ggml_init ok\n");
+              fflush(stderr);
+              ggml_free(ctx);
+              fprintf(stderr, "[init-diag] stage 2: ggml_free ok\n");
+              fflush(stderr);
+          }
+          '@
+
           if (-not $llamaSource.Contains($oldInit)) {
             throw "Expected llama_backend_init implementation was not found"
           }
@@ -216,10 +230,137 @@ jobs:
             "1" { $newInit = $stage1 }
             "2" { $newInit = $stage2 }
             "3" { $newInit = $stage3 }
+            "4" { $newInit = $stage4 }
             default { throw "Unsupported diagnostic stage: $env:DIAG_STAGE" }
           }
           $llamaSource = $llamaSource.Replace($oldInit, $newInit)
           Set-Content $llamaSourcePath $llamaSource -Encoding UTF8
+
+          $ggmlSourcePath = "src\vendor\llama.cpp\ggml\src\ggml.c"
+          $ggmlSource = Get-Content $ggmlSourcePath -Raw
+          $oldGgmlInit = @'
+          struct ggml_context * ggml_init(struct ggml_init_params params) {
+              static bool is_first_call = true;
+
+              ggml_critical_section_start();
+
+              if (is_first_call) {
+                  // initialize time system (required on Windows)
+                  ggml_time_init();
+
+                  is_first_call = false;
+              }
+
+              ggml_critical_section_end();
+
+              struct ggml_context * ctx = GGML_MALLOC(sizeof(struct ggml_context));
+
+              // allow to call ggml_init with 0 size
+              if (params.mem_size == 0) {
+                  params.mem_size = GGML_MEM_ALIGN;
+              }
+
+              const size_t mem_size = params.mem_buffer ? params.mem_size : GGML_PAD(params.mem_size, GGML_MEM_ALIGN);
+
+              *ctx = (struct ggml_context) {
+                  /*.mem_size           =*/ mem_size,
+                  /*.mem_buffer         =*/ params.mem_buffer ? params.mem_buffer : ggml_aligned_malloc(mem_size),
+                  /*.mem_buffer_owned   =*/ params.mem_buffer ? false : true,
+                  /*.no_alloc           =*/ params.no_alloc,
+                  /*.n_objects          =*/ 0,
+                  /*.objects_begin      =*/ NULL,
+                  /*.objects_end        =*/ NULL,
+              };
+
+              GGML_ASSERT(ctx->mem_buffer != NULL);
+
+              GGML_ASSERT_ALIGNED(ctx->mem_buffer);
+
+              GGML_PRINT_DEBUG("%s: context initialized\n", __func__);
+
+              return ctx;
+          }
+          '@
+
+          $diagnosticGgmlInit = @'
+          struct ggml_context * ggml_init(struct ggml_init_params params) {
+              static bool is_first_call = true;
+
+              fprintf(stderr, "[ggml-init] 2.1 critical section begin\n");
+              fflush(stderr);
+              ggml_critical_section_start();
+              fprintf(stderr, "[ggml-init] 2.1 critical section locked\n");
+              fflush(stderr);
+
+              if (is_first_call) {
+                  fprintf(stderr, "[ggml-init] 2.2 first-call timer begin\n");
+                  fflush(stderr);
+                  ggml_time_init();
+                  fprintf(stderr, "[ggml-init] 2.2 first-call timer ok\n");
+                  fflush(stderr);
+                  is_first_call = false;
+              }
+
+              fprintf(stderr, "[ggml-init] 2.3 critical section unlock begin\n");
+              fflush(stderr);
+              ggml_critical_section_end();
+              fprintf(stderr, "[ggml-init] 2.3 critical section unlocked\n");
+              fflush(stderr);
+
+              fprintf(stderr, "[ggml-init] 2.4 context malloc begin (%zu bytes)\n", sizeof(struct ggml_context));
+              fflush(stderr);
+              struct ggml_context * ctx = GGML_MALLOC(sizeof(struct ggml_context));
+              fprintf(stderr, "[ggml-init] 2.4 context malloc result=%p\n", (void *) ctx);
+              fflush(stderr);
+
+              if (params.mem_size == 0) {
+                  params.mem_size = GGML_MEM_ALIGN;
+              }
+              fprintf(stderr, "[ggml-init] 2.5 normalized mem_size=%zu\n", params.mem_size);
+              fflush(stderr);
+
+              const size_t mem_size = params.mem_buffer ? params.mem_size : GGML_PAD(params.mem_size, GGML_MEM_ALIGN);
+              fprintf(stderr, "[ggml-init] 2.6 aligned allocation begin (%zu bytes)\n", mem_size);
+              fflush(stderr);
+              void * mem_buffer = params.mem_buffer ? params.mem_buffer : ggml_aligned_malloc(mem_size);
+              fprintf(stderr, "[ggml-init] 2.6 aligned allocation result=%p\n", mem_buffer);
+              fflush(stderr);
+
+              fprintf(stderr, "[ggml-init] 2.7 context assignment begin\n");
+              fflush(stderr);
+              *ctx = (struct ggml_context) {
+                  /*.mem_size           =*/ mem_size,
+                  /*.mem_buffer         =*/ mem_buffer,
+                  /*.mem_buffer_owned   =*/ params.mem_buffer ? false : true,
+                  /*.no_alloc           =*/ params.no_alloc,
+                  /*.n_objects          =*/ 0,
+                  /*.objects_begin      =*/ NULL,
+                  /*.objects_end        =*/ NULL,
+              };
+              fprintf(stderr, "[ggml-init] 2.7 context assignment ok\n");
+              fflush(stderr);
+
+              GGML_ASSERT(ctx->mem_buffer != NULL);
+              fprintf(stderr, "[ggml-init] 2.8 non-null assertion ok\n");
+              fflush(stderr);
+
+              GGML_ASSERT_ALIGNED(ctx->mem_buffer);
+              fprintf(stderr, "[ggml-init] 2.9 alignment assertion ok\n");
+              fflush(stderr);
+
+              GGML_PRINT_DEBUG("%s: context initialized\n", __func__);
+              fprintf(stderr, "[ggml-init] 2.10 return context=%p\n", (void *) ctx);
+              fflush(stderr);
+
+              return ctx;
+          }
+          '@
+
+          if (-not $ggmlSource.Contains($oldGgmlInit)) {
+            throw "Expected ggml_init implementation was not found"
+          }
+          $ggmlSource = $ggmlSource.Replace($oldGgmlInit, $diagnosticGgmlInit)
+          Set-Content $ggmlSourcePath $ggmlSource -Encoding UTF8
 
           $initPath = "src\llama_cpp\__init__.py"
           $init = Get-Content $initPath -Raw
@@ -231,7 +372,7 @@ jobs:
           $init = $init.Replace($oldVersion, $newVersion)
           Set-Content $initPath $init -Encoding UTF8
 
-          git -C src diff -- CMakeLists.txt llama_cpp/__init__.py vendor/llama.cpp/src/CMakeLists.txt vendor/llama.cpp/src/llama.cpp
+          git -C src diff -- CMakeLists.txt llama_cpp/__init__.py vendor/llama.cpp/src/CMakeLists.txt vendor/llama.cpp/src/llama.cpp vendor/llama.cpp/ggml/src/ggml.c
 
       - name: Configure conservative monolithic CPU build
         shell: pwsh
@@ -350,13 +491,12 @@ jobs:
           cat > release-notes.md <<'EOF'
           Diagnostic Windows x64 / Python 3.9 wheels for llama-cpp-python 0.3.34.
 
-          Install and test the wheels in order:
+          The `diag.ggml1` wheel instruments every operation inside `ggml_init()`:
+          the global critical-section mutex, first-call timer, normal and aligned
+          allocations, context assignment, and alignment checks.
 
-          1. `diag.stage1` tests only Windows timer initialization.
-          2. `diag.stage2` adds GGML context allocation and release.
-          3. `diag.stage3` adds backend registry inspection/loading.
-
-          These wheels are diagnostic only. Use their stderr checkpoint output to identify the exact stage producing the access violation.
+          This wheel is diagnostic only. The last stderr checkpoint printed before
+          an access violation identifies the exact failing operation.
           EOF
 
       - name: Create or update GitHub prerelease
