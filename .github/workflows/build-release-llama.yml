@@ -31,7 +31,7 @@ on:
       - main
     paths:
       - ".github/workflows/build-release-llama.yml"
-      - ".github/workflows/build-conservative-windows-wheels.yml"
+      - ".github/workflows/build-init-stage-diagnostics.yml"
 
 permissions:
   contents: write
@@ -46,7 +46,7 @@ jobs:
     with:
       version: "0.3.34"
       publish_release: true
-      release_tag: "v0.3.34-win39-ggml-init-diagnostic-r3"
+      release_tag: "v0.3.34-win39-sync-diagnostic-r4"
     permissions:
       contents: write
 
