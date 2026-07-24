@@ -17,7 +17,7 @@ on:
         description: GitHub release tag
         required: false
         type: string
-        default: "v0.3.34-win39-ggml-init-diagnostic-r3"
+        default: "v0.3.34-win39-sync-diagnostic-r4"
   workflow_dispatch:
     inputs:
       version:
@@ -32,7 +32,7 @@ on:
       release_tag:
         description: GitHub release tag
         required: true
-        default: "v0.3.34-win39-ggml-init-diagnostic-r3"
+        default: "v0.3.34-win39-sync-diagnostic-r4"
 
 permissions:
   contents: write
@@ -42,18 +42,21 @@ env:
 
 jobs:
   build:
-    name: init-stage-${{ matrix.stage }}
+    name: sync-${{ matrix.sync }}
     runs-on: windows-2022
     strategy:
       fail-fast: false
       matrix:
         include:
-          - stage: "4"
-            variant: ggml-init-internal
-            package_suffix: diag.ggml1
+          - sync: srw
+            variant: sync-srw
+            package_suffix: diag.sync.srw1
+          - sync: nolock
+            variant: sync-nolock
+            package_suffix: diag.sync.nolock1
 
     env:
-      DIAG_STAGE: ${{ matrix.stage }}
+      SYNC_VARIANT: ${{ matrix.sync }}
       BUILD_VARIANT: ${{ matrix.variant }}
       PACKAGE_VERSION: ${{ format('{0}+{1}', inputs.version || '0.3.34', matrix.package_suffix) }}
 
@@ -83,7 +86,7 @@ jobs:
           git -C src rev-parse HEAD
           git -C src submodule status
 
-      - name: Patch monolithic layout and staged initialization
+      - name: Patch monolithic layout and synchronization variant
         shell: pwsh
         run: |
           $pythonCmakePath = "src\CMakeLists.txt"
@@ -226,14 +229,7 @@ jobs:
             throw "Expected llama_backend_init implementation was not found"
           }
 
-          switch ($env:DIAG_STAGE) {
-            "1" { $newInit = $stage1 }
-            "2" { $newInit = $stage2 }
-            "3" { $newInit = $stage3 }
-            "4" { $newInit = $stage4 }
-            default { throw "Unsupported diagnostic stage: $env:DIAG_STAGE" }
-          }
-          $llamaSource = $llamaSource.Replace($oldInit, $newInit)
+          $llamaSource = $llamaSource.Replace($oldInit, $stage4)
           Set-Content $llamaSourcePath $llamaSource -Encoding UTF8
 
           $ggmlSourcePath = "src\vendor\llama.cpp\ggml\src\ggml.c"
@@ -362,6 +358,66 @@ jobs:
           $ggmlSource = $ggmlSource.Replace($oldGgmlInit, $diagnosticGgmlInit)
           Set-Content $ggmlSourcePath $ggmlSource -Encoding UTF8
 
+          $threadingPath = "src\vendor\llama.cpp\ggml\src\ggml-threading.cpp"
+          $threadingSource = Get-Content $threadingPath -Raw
+          $oldThreading = @'
+          #include "ggml-threading.h"
+          #include <mutex>
+
+          std::mutex ggml_critical_section_mutex;
+
+          void ggml_critical_section_start() {
+              ggml_critical_section_mutex.lock();
+          }
+
+          void ggml_critical_section_end(void) {
+              ggml_critical_section_mutex.unlock();
+          }
+          '@
+
+          $srwThreading = @'
+          #include "ggml-threading.h"
+
+          #define WIN32_LEAN_AND_MEAN
+          #include <windows.h>
+
+          // SRWLOCK_INIT requires no C++ dynamic initialization. This avoids
+          // entering std::mutex::lock() on an uninitialized global object.
+          static SRWLOCK ggml_critical_section_lock = SRWLOCK_INIT;
+
+          void ggml_critical_section_start(void) {
+              AcquireSRWLockExclusive(&ggml_critical_section_lock);
+          }
+
+          void ggml_critical_section_end(void) {
+              ReleaseSRWLockExclusive(&ggml_critical_section_lock);
+          }
+          '@
+
+          $noLockThreading = @'
+          #include "ggml-threading.h"
+
+          // Diagnostic control only. Safe for this single-threaded backend-init
+          // probe, but not intended for concurrent model use.
+          void ggml_critical_section_start(void) {
+          }
+
+          void ggml_critical_section_end(void) {
+          }
+          '@
+
+          if (-not $threadingSource.Contains($oldThreading)) {
+            throw "Expected ggml-threading.cpp implementation was not found"
+          }
+
+          switch ($env:SYNC_VARIANT) {
+            "srw"    { $newThreading = $srwThreading }
+            "nolock" { $newThreading = $noLockThreading }
+            default  { throw "Unsupported synchronization variant: $env:SYNC_VARIANT" }
+          }
+          $threadingSource = $threadingSource.Replace($oldThreading, $newThreading)
+          Set-Content $threadingPath $threadingSource -Encoding UTF8
+
           $initPath = "src\llama_cpp\__init__.py"
           $init = Get-Content $initPath -Raw
           $oldVersion = "__version__ = `"$env:SOURCE_VERSION`""
@@ -372,7 +428,7 @@ jobs:
           $init = $init.Replace($oldVersion, $newVersion)
           Set-Content $initPath $init -Encoding UTF8
 
-          git -C src diff -- CMakeLists.txt llama_cpp/__init__.py vendor/llama.cpp/src/CMakeLists.txt vendor/llama.cpp/src/llama.cpp vendor/llama.cpp/ggml/src/ggml.c
+          git -C src diff -- CMakeLists.txt llama_cpp/__init__.py vendor/llama.cpp/src/CMakeLists.txt vendor/llama.cpp/src/llama.cpp vendor/llama.cpp/ggml/src/ggml.c vendor/llama.cpp/ggml/src/ggml-threading.cpp
 
       - name: Configure conservative monolithic CPU build
         shell: pwsh
@@ -434,7 +490,7 @@ jobs:
           & $testPython -m pip install --no-cache-dir $wheel.FullName
 
           New-Item -ItemType Directory -Force reports | Out-Null
-          & $testPython -I -X faulthandler -u -c "import llama_cpp; print(llama_cpp.__version__); llama_cpp.llama_backend_init(); print('BACKEND OK')" 2>&1 |
+          & $testPython -I -X faulthandler -u -c "import llama_cpp; print(llama_cpp.__version__); llama_cpp.llama_backend_init(); print('BACKEND OK'); llama_cpp.llama_backend_free(); print('BACKEND FREE OK')" 2>&1 |
             Tee-Object "reports\$env:BUILD_VARIANT-backend-init.txt"
 
       - name: Create reproducibility manifest
@@ -444,7 +500,7 @@ jobs:
           New-Item -ItemType Directory -Force reports | Out-Null
           $manifest = "reports\$env:BUILD_VARIANT-build-manifest.txt"
           "variant=$env:BUILD_VARIANT" | Set-Content $manifest
-          "diagnostic_stage=$env:DIAG_STAGE" | Add-Content $manifest
+          "sync_variant=$env:SYNC_VARIANT" | Add-Content $manifest
           "package_version=$env:PACKAGE_VERSION" | Add-Content $manifest
           "source_version=$env:SOURCE_VERSION" | Add-Content $manifest
           "source_commit=$(git -C src rev-parse HEAD)" | Add-Content $manifest
@@ -489,14 +545,19 @@ jobs:
         shell: bash
         run: |
           cat > release-notes.md <<'EOF'
-          Diagnostic Windows x64 / Python 3.9 wheels for llama-cpp-python 0.3.34.
+          Windows x64 / Python 3.9 synchronization diagnostic wheels for
+          llama-cpp-python 0.3.34.
 
-          The `diag.ggml1` wheel instruments every operation inside `ggml_init()`:
-          the global critical-section mutex, first-call timer, normal and aligned
-          allocations, context assignment, and alignment checks.
+          Assets:
+          - `diag.sync.srw1`: candidate fix replacing the process-global
+            C++ `std::mutex` with a statically initialized Windows `SRWLOCK`.
+          - `diag.sync.nolock1`: diagnostic control that bypasses the
+            critical section. It is only for the single-threaded initialization probe
+            and must not be used for concurrent model workloads.
 
-          This wheel is diagnostic only. The last stderr checkpoint printed before
-          an access violation identifies the exact failing operation.
+          Both wheels retain checkpoint logging inside `ggml_init()` and are
+          validated with `llama_backend_init()` and `llama_backend_free()`
+          before publication.
           EOF
 
       - name: Create or update GitHub prerelease
