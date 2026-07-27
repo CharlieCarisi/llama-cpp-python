@@ -176,7 +176,6 @@ jobs:
         run: |
           $flags = @(
             "-DCMAKE_BUILD_TYPE=Release",
-            "-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON",
             "-DBUILD_SHARED_LIBS=OFF",
             "-DLLAVA_BUILD=OFF",
             "-DGGML_NATIVE=OFF",
