@@ -45,8 +45,10 @@ jobs:
     uses: ./.github/workflows/build-optimized-windows-wheels.yml
     with:
       version: "0.3.34"
+      publish_release: true
+      release_tag: "v0.3.34-win39-srw-optimized-r1"
     permissions:
-      contents: read
+      contents: write
 
   build-release:
     if: github.event_name == 'workflow_dispatch'
