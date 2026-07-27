@@ -17,7 +17,7 @@ permissions:
 
 env:
   SOURCE_VERSION: "0.3.34"
-  PACKAGE_VERSION: "0.3.34+win.srw.vulkan.xelegacy1"
+  PACKAGE_VERSION: "0.3.34+win.srw.vulkan.xelegacy2"
   VULKAN_SDK_VERSION: "1.4.341.0"
 
 jobs:
@@ -238,6 +238,120 @@ jobs:
             throw "Expected Vulkan registry implementation was not found"
           }
           $vulkanSource = $vulkanSource.Replace($oldRegistry, $legacyRegistry)
+
+          $oldBackendInit = @'
+          ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
+              VK_LOG_DEBUG("ggml_backend_vk_init(" << dev_num << ")");
+
+              ggml_backend_vk_context * ctx = new ggml_backend_vk_context;
+              ggml_vk_init(ctx, dev_num);
+
+              ggml_backend_t vk_backend = new ggml_backend {
+                  /* .guid    = */ ggml_backend_vk_guid(),
+                  /* .iface   = */ ggml_backend_vk_interface,
+                  /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), dev_num),
+                  /* .context = */ ctx,
+              };
+
+              if (!ctx->device->support_async) {
+                  vk_backend->iface.get_tensor_async = nullptr;
+              }
+
+              return vk_backend;
+          }
+          '@
+
+          $legacyBackendInit = @'
+          // Internal path used when the backend registry has already resolved the
+          // device. Passing that device through avoids a second registry traversal.
+          static ggml_backend_t ggml_backend_vk_init_with_device(size_t dev_num, ggml_backend_dev_t backend_device) {
+              GGML_LOG_INFO("[vulkan-legacy2] backend init begin: index=%zu device=%p\n", dev_num, (void *) backend_device);
+
+              ggml_backend_vk_context * ctx = new ggml_backend_vk_context;
+              GGML_LOG_INFO("[vulkan-legacy2] backend context allocated: ctx=%p\n", (void *) ctx);
+              ggml_vk_init(ctx, dev_num);
+              GGML_LOG_INFO("[vulkan-legacy2] ggml_vk_init complete: vk_device=%p\n", (void *) ctx->device.get());
+
+              ggml_backend_t vk_backend = new ggml_backend {
+                  /* .guid    = */ ggml_backend_vk_guid(),
+                  /* .iface   = */ ggml_backend_vk_interface,
+                  /* .device  = */ backend_device,
+                  /* .context = */ ctx,
+              };
+              GGML_LOG_INFO("[vulkan-legacy2] backend object allocated: backend=%p device=%p\n", (void *) vk_backend, (void *) vk_backend->device);
+
+              if (!ctx->device->support_async) {
+                  vk_backend->iface.get_tensor_async = nullptr;
+              }
+
+              GGML_LOG_INFO("[vulkan-legacy2] backend init complete\n");
+              return vk_backend;
+          }
+
+          ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
+              GGML_LOG_INFO("[vulkan-legacy2] public backend init resolving registry device: index=%zu\n", dev_num);
+              ggml_backend_dev_t backend_device = ggml_backend_reg_dev_get(ggml_backend_vk_reg(), dev_num);
+              GGML_LOG_INFO("[vulkan-legacy2] public backend init resolved device=%p\n", (void *) backend_device);
+              return ggml_backend_vk_init_with_device(dev_num, backend_device);
+          }
+          '@
+
+          if (-not $vulkanSource.Contains($oldBackendInit)) {
+            throw "Expected Vulkan backend initialization implementation was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldBackendInit, $legacyBackendInit)
+
+          $oldDeviceBufferType = @'
+          static ggml_backend_buffer_type_t ggml_backend_vk_device_get_buffer_type(ggml_backend_dev_t dev) {
+              ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
+              return ggml_backend_vk_buffer_type(ctx->device);
+          }
+          '@
+
+          $legacyDeviceBufferType = @'
+          static ggml_backend_buffer_type_t ggml_backend_vk_device_get_buffer_type(ggml_backend_dev_t dev) {
+              GGML_LOG_INFO("[vulkan-legacy2] buffer type lookup begin: dev=%p\n", (void *) dev);
+              ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *) dev->context;
+              GGML_LOG_INFO("[vulkan-legacy2] buffer type context: ctx=%p index=%zu\n", (void *) ctx, ctx->device);
+              ggml_backend_buffer_type_t buffer_type = ggml_backend_vk_buffer_type(ctx->device);
+              GGML_LOG_INFO("[vulkan-legacy2] buffer type lookup complete: buft=%p context=%p\n",
+                            (void *) buffer_type, buffer_type ? buffer_type->context : nullptr);
+              return buffer_type;
+          }
+          '@
+
+          if (-not $vulkanSource.Contains($oldDeviceBufferType)) {
+            throw "Expected Vulkan device buffer-type implementation was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldDeviceBufferType, $legacyDeviceBufferType)
+
+          $oldDeviceInit = @'
+          static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const char * params) {
+              UNUSED(params);
+              ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
+              return ggml_backend_vk_init(ctx->device);
+          }
+          '@
+
+          $legacyDeviceInit = @'
+          static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const char * params) {
+              UNUSED(params);
+              GGML_LOG_INFO("[vulkan-legacy2] registry device init begin: dev=%p\n", (void *) dev);
+              ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *) dev->context;
+              GGML_LOG_INFO("[vulkan-legacy2] registry device init context: ctx=%p index=%zu\n", (void *) ctx, ctx->device);
+
+              // The registry already supplied dev. Reuse it directly instead of
+              // calling the public initializer, which resolves the registry again.
+              ggml_backend_t backend = ggml_backend_vk_init_with_device(ctx->device, dev);
+              GGML_LOG_INFO("[vulkan-legacy2] registry device init complete: backend=%p\n", (void *) backend);
+              return backend;
+          }
+          '@
+
+          if (-not $vulkanSource.Contains($oldDeviceInit)) {
+            throw "Expected Vulkan registry device initializer was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldDeviceInit, $legacyDeviceInit)
           Set-Content $vulkanPath $vulkanSource -Encoding UTF8
 
           $initPath = "src\llama_cpp\__init__.py"
@@ -356,6 +470,8 @@ jobs:
           "core_srwlock_fix=enabled" | Add-Content $manifest
           "vulkan_registry_pod_state=enabled" | Add-Content $manifest
           "vulkan_registry_srwlock=enabled" | Add-Content $manifest
+          "vulkan_direct_registry_device_init=enabled" | Add-Content $manifest
+          "vulkan_buffer_type_checkpoints=enabled" | Add-Content $manifest
           "submodules:" | Add-Content $manifest
           git -C src submodule status | Add-Content $manifest
 
@@ -398,7 +514,7 @@ jobs:
           cat > release-notes.md <<'EOF'
           Experimental Windows x64 / Python 3.9 Vulkan compatibility wheel for llama-cpp-python 0.3.34 and legacy Intel Iris Xe driver stacks.
 
-          This build keeps the confirmed GGML SRWLOCK fix and additionally replaces the Vulkan registry's function-local C++ vector and mutex initialization with zero-initialized registry state and a Windows SRWLOCK.
+          This build keeps the confirmed GGML and Vulkan-registry SRWLOCK fixes. It also passes the already-resolved Vulkan registry device directly into backend construction, avoiding the second registry traversal seen immediately before the target workstation's GPU-offload crash. Buffer-type and backend-construction checkpoints are enabled for the real Iris Xe test.
 
           The GitHub Windows runner validated:
           - wheel packaging and clean Python 3.9 installation
@@ -406,7 +522,7 @@ jobs:
           - DLL dependencies
           - reproducibility manifest and SHA-256
 
-          GitHub's runner has no Vulkan GPU. Actual Vulkan-device initialization and offload must be validated on the target Iris Xe workstation. This is a compatibility prerelease, not a replacement for the stable optimized CPU wheel.
+          GitHub's runner has no Vulkan GPU. It can validate compilation, packaging, and backend initialization, but actual tensor placement and offload must be validated on the target Iris Xe workstation. This is a diagnostic compatibility prerelease, not a replacement for the stable optimized CPU wheel.
           EOF
 
       - name: Create or update public prerelease
@@ -414,7 +530,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: v0.3.34-win39-vulkan-xelegacy-r1
+          RELEASE_TAG: v0.3.34-win39-vulkan-xelegacy-r2
           RELEASE_TARGET: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           mapfile -d '' assets < <(find release-assets -type f -print0)
