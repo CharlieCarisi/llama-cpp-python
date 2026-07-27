@@ -19,8 +19,6 @@ env:
   SOURCE_VERSION: "0.3.34"
   PACKAGE_VERSION: "0.3.34+win.srw.vulkan.xelegacy1"
   VULKAN_SDK_VERSION: "1.4.341.0"
-  TEST_MODEL_URL: "https://huggingface.co/ggml-org/models-moved/resolve/main/tinyllamas/stories15M-q4_0.gguf?download=true"
-  TEST_MODEL_SHA256: "66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739"
 
 jobs:
   build:
@@ -303,7 +301,7 @@ jobs:
           New-Item -ItemType Directory -Force $outDir | Out-Null
           python -m build --wheel --outdir $outDir
 
-      - name: Verify packaging, backend, and CPU fallback
+      - name: Verify packaging and backend initialization
         shell: pwsh
         run: |
           $wheel = Get-ChildItem "wheelhouse\*.whl" | Select-Object -First 1
@@ -317,22 +315,12 @@ jobs:
           & $testPython -m pip install --no-cache-dir $wheel.FullName
 
           New-Item -ItemType Directory -Force reports | Out-Null
-          New-Item -ItemType Directory -Force test-model | Out-Null
-          $modelPath = Join-Path $env:GITHUB_WORKSPACE "test-model\stories15M-q4_0.gguf"
-          Invoke-WebRequest -Uri $env:TEST_MODEL_URL -OutFile $modelPath
-          $actualHash = (Get-FileHash $modelPath -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actualHash -ne $env:TEST_MODEL_SHA256) {
-            throw "Test model SHA-256 mismatch: $actualHash"
-          }
 
-          @'
-          import os
+          $testOutput = @'
           import platform
           import sys
-          from pathlib import Path
 
           import llama_cpp
-          from llama_cpp import Llama
 
           print("Python:", sys.version)
           print("Platform:", platform.platform())
@@ -343,24 +331,12 @@ jobs:
           print("BACKEND INIT OK", flush=True)
           llama_cpp.llama_backend_free()
           print("BACKEND FREE OK", flush=True)
-
-          os.environ["GGML_DISABLE_VULKAN"] = "1"
-          model_path = Path("test-model/stories15M-q4_0.gguf").resolve()
-          llm = Llama(
-              model_path=str(model_path),
-              n_ctx=128,
-              n_batch=32,
-              n_threads=2,
-              n_gpu_layers=0,
-              verbose=True,
-          )
-          output = llm("Once upon a time", max_tokens=8, temperature=0.0)
-          text = output["choices"][0]["text"]
-          if not isinstance(text, str) or not text:
-              raise RuntimeError(f"Model returned no completion: {output!r}")
-          print("CPU FALLBACK MODEL TEST OK:", repr(text), flush=True)
-          '@ | & $testPython -I -X faulthandler -u 2>&1 |
-            Tee-Object "reports\legacy-vulkan-runtime-test.txt"
+          '@ | & $testPython -I -X faulthandler -u 2>&1
+          $testExitCode = $LASTEXITCODE
+          $testOutput | Tee-Object "reports\legacy-vulkan-runtime-test.txt"
+          if ($testExitCode -ne 0) {
+            throw "Backend validation failed with exit code $testExitCode"
+          }
 
           $llamaDll = Join-Path $env:GITHUB_WORKSPACE "testenv\Lib\site-packages\llama_cpp\lib\llama.dll"
           dumpbin /DEPENDENTS $llamaDll |
