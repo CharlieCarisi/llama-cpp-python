@@ -8,12 +8,32 @@ on:
         required: false
         type: string
         default: "0.3.34"
+      publish_release:
+        description: Publish successful wheels and reports in a public GitHub prerelease
+        required: false
+        type: boolean
+        default: false
+      release_tag:
+        description: GitHub prerelease tag
+        required: false
+        type: string
+        default: "v0.3.34-win39-srw-optimized-r1"
   workflow_dispatch:
     inputs:
       version:
         description: llama-cpp-python release version
         required: true
         default: "0.3.34"
+      publish_release:
+        description: Publish successful wheels and reports in a public GitHub prerelease
+        required: true
+        type: boolean
+        default: true
+      release_tag:
+        description: GitHub prerelease tag
+        required: true
+        default: "v0.3.34-win39-srw-optimized-r1"
+
 permissions:
   contents: read
 
@@ -329,3 +349,65 @@ jobs:
             reports/${{ matrix.variant }}-*.txt
           if-no-files-found: error
           retention-days: 30
+
+  publish:
+    name: Publish optimized wheel prerelease
+    if: ${{ inputs.publish_release }}
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download optimized wheels and reports
+        uses: actions/download-artifact@v7
+        with:
+          pattern: llama-cpp-python-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Prepare release notes
+        shell: bash
+        run: |
+          cat > release-notes.md <<'EOF'
+          Optimized Windows x64 / Python 3.9 wheels for llama-cpp-python 0.3.34 with the confirmed Windows SRWLOCK compatibility fix.
+
+          Variants:
+          - optimized CPU build for Intel Core i7-1185G7 / Tiger Lake
+          - optimized Vulkan build for Intel Iris Xe, with the same CPU fallback
+
+          Both wheels use Release /O2, AVX2, FMA, F16C, BMI2, AVX-512, VBMI, VNNI, CPU repacking, and OpenMP. The Vulkan wheel additionally enables GGML Vulkan. Whole-program LTO is intentionally disabled because MSVC link-time code generation crashed while linking the monolithic llama.dll.
+
+          Included reports provide runtime smoke-test results, DLL dependencies, build configuration, source revisions, wheel sizes, and SHA-256 hashes.
+
+          Install a wheel directly with pip by copying its release-asset URL.
+          EOF
+
+      - name: Create or update public prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_TARGET: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          mapfile -d '' assets < <(find release-assets -type f -print0)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "No release assets were downloaded" >&2
+            exit 1
+          fi
+
+          if gh release view "$RELEASE_TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber --repo "$GH_REPO"
+            gh release edit "$RELEASE_TAG" \
+              --repo "$GH_REPO" \
+              --title "$RELEASE_TAG" \
+              --notes-file release-notes.md \
+              --prerelease
+          else
+            gh release create "$RELEASE_TAG" "${assets[@]}" \
+              --repo "$GH_REPO" \
+              --target "$RELEASE_TARGET" \
+              --title "$RELEASE_TAG" \
+              --notes-file release-notes.md \
+              --prerelease
+          fi
