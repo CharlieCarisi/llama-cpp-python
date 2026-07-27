@@ -1,0 +1,402 @@
+name: Build legacy Intel Vulkan compatibility wheel
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+    branches:
+      - main
+    paths:
+      - ".github/workflows/build-legacy-vulkan-wheel.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_VERSION: "0.3.34"
+  PACKAGE_VERSION: "0.3.34+win.srw.vulkan.xelegacy1"
+  VULKAN_SDK_VERSION: "1.4.341.0"
+  TEST_MODEL_URL: "https://huggingface.co/ggml-org/models-moved/resolve/main/tinyllamas/stories15M-q4_0.gguf?download=true"
+  TEST_MODEL_SHA256: "66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739"
+
+jobs:
+  build:
+    name: legacy-vulkan-irisxe
+    runs-on: windows-2022
+
+    steps:
+      - name: Set up MSVC x64
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Set up Python 3.9 x64
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.9"
+          architecture: x64
+
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: |
+          choco install vulkan-sdk --version="$env:VULKAN_SDK_VERSION" --no-progress -y
+          $sdk = Join-Path "C:\VulkanSDK" $env:VULKAN_SDK_VERSION
+          if (-not (Test-Path $sdk)) {
+            throw "Vulkan SDK was not found at $sdk"
+          }
+          "VULKAN_SDK=$sdk" >> $env:GITHUB_ENV
+          "$sdk\Bin" >> $env:GITHUB_PATH
+          & "$sdk\Bin\glslc.exe" --version
+
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade "pip<26"
+          python -m pip install build wheel ninja
+
+      - name: Clone exact upstream release
+        shell: pwsh
+        run: |
+          $tag = "v$env:SOURCE_VERSION"
+          git clone --branch $tag --depth 1 --recurse-submodules --shallow-submodules https://github.com/abetlen/llama-cpp-python.git src
+          git -C src rev-parse HEAD
+          git -C src submodule status
+
+      - name: Apply monolithic layout and Windows compatibility fixes
+        shell: pwsh
+        run: |
+          $pythonCmakePath = "src\CMakeLists.txt"
+          $pythonCmake = Get-Content $pythonCmakePath -Raw
+          $sharedSetting = 'set(BUILD_SHARED_LIBS "On")'
+          if (-not $pythonCmake.Contains($sharedSetting)) {
+            throw "Expected BUILD_SHARED_LIBS setting was not found"
+          }
+          $pythonCmake = $pythonCmake.Replace(
+            $sharedSetting,
+            'set(BUILD_SHARED_LIBS "Off")'
+          )
+
+          $ggmlRuntimeInstalls = [regex]'(?ms)\s*install\(\s*FILES \$<TARGET_RUNTIME_DLLS:ggml>\s*DESTINATION [^\r\n]+\s*\)'
+          $ggmlRuntimeInstallMatches = $ggmlRuntimeInstalls.Matches($pythonCmake)
+          if ($ggmlRuntimeInstallMatches.Count -ne 2) {
+            throw "Expected two ggml runtime-DLL install rules, found $($ggmlRuntimeInstallMatches.Count)"
+          }
+          $pythonCmake = $ggmlRuntimeInstalls.Replace($pythonCmake, "")
+          Set-Content $pythonCmakePath $pythonCmake -Encoding UTF8
+
+          $llamaCmakePath = "src\vendor\llama.cpp\src\CMakeLists.txt"
+          $llamaCmake = Get-Content $llamaCmakePath -Raw
+          $addLlama = [regex]'add_library\(llama\s*\r?\n'
+          if (-not $addLlama.IsMatch($llamaCmake)) {
+            throw "Expected add_library(llama) declaration was not found"
+          }
+          $llamaCmake = $addLlama.Replace(
+            $llamaCmake,
+            "add_library(llama SHARED`r`n",
+            1
+          )
+          Set-Content $llamaCmakePath $llamaCmake -Encoding UTF8
+
+          $threadingPath = "src\vendor\llama.cpp\ggml\src\ggml-threading.cpp"
+          $threadingSource = Get-Content $threadingPath -Raw
+          $oldThreading = @'
+          #include "ggml-threading.h"
+          #include <mutex>
+
+          std::mutex ggml_critical_section_mutex;
+
+          void ggml_critical_section_start() {
+              ggml_critical_section_mutex.lock();
+          }
+
+          void ggml_critical_section_end(void) {
+              ggml_critical_section_mutex.unlock();
+          }
+          '@
+
+          $srwThreading = @'
+          #include "ggml-threading.h"
+
+          #define WIN32_LEAN_AND_MEAN
+          #include <windows.h>
+
+          static SRWLOCK ggml_critical_section_lock = SRWLOCK_INIT;
+
+          void ggml_critical_section_start(void) {
+              AcquireSRWLockExclusive(&ggml_critical_section_lock);
+          }
+
+          void ggml_critical_section_end(void) {
+              ReleaseSRWLockExclusive(&ggml_critical_section_lock);
+          }
+          '@
+
+          if (-not $threadingSource.Contains($oldThreading)) {
+            throw "Expected ggml-threading.cpp implementation was not found"
+          }
+          $threadingSource = $threadingSource.Replace($oldThreading, $srwThreading)
+          Set-Content $threadingPath $threadingSource -Encoding UTF8
+
+          $vulkanPath = "src\vendor\llama.cpp\ggml\src\ggml-vulkan\ggml-vulkan.cpp"
+          $vulkanSource = Get-Content $vulkanPath -Raw
+          $oldRegistry = @'
+          static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg, size_t device) {
+              static std::vector<ggml_backend_dev_t> devices;
+
+              static bool initialized = false;
+
+              {
+                  static std::mutex mutex;
+                  std::lock_guard<std::mutex> lock(mutex);
+                  if (!initialized) {
+                      const int min_batch_size = getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
+                      for (int i = 0; i < ggml_backend_vk_get_device_count(); i++) {
+                          ggml_backend_vk_device_context * ctx = new ggml_backend_vk_device_context;
+                          char desc[256];
+                          ggml_backend_vk_get_device_description(i, desc, sizeof(desc));
+                          ctx->device = i;
+                          ctx->name = GGML_VK_NAME + std::to_string(i);
+                          ctx->description = desc;
+                          ctx->is_integrated_gpu = ggml_backend_vk_get_device_type(i) == vk::PhysicalDeviceType::eIntegratedGpu;
+                          ctx->pci_bus_id = ggml_backend_vk_get_device_pci_id(i);
+                          ctx->op_offload_min_batch_size = min_batch_size;
+                          devices.push_back(new ggml_backend_device {
+                              /* .iface   = */ ggml_backend_vk_device_i,
+                              /* .reg     = */ reg,
+                              /* .context = */ ctx,
+                          });
+                      }
+                      initialized = true;
+                  }
+              }
+
+              GGML_ASSERT(device < devices.size());
+              return devices[device];
+          }
+          '@
+
+          $legacyRegistry = @'
+          // Keep registry state in zero-initialized POD values. This avoids the
+          // function-local std::vector and std::mutex initialization paths that
+          // fault on the target Windows/Python 3.9 + legacy Intel driver stack.
+          static SRWLOCK ggml_backend_vk_devices_lock = SRWLOCK_INIT;
+          static ggml_backend_dev_t * ggml_backend_vk_devices = nullptr;
+          static size_t ggml_backend_vk_devices_count = 0;
+          static bool ggml_backend_vk_devices_initialized = false;
+
+          struct ggml_vk_srwlock_guard {
+              SRWLOCK * lock;
+
+              explicit ggml_vk_srwlock_guard(SRWLOCK * lock) : lock(lock) {
+                  AcquireSRWLockExclusive(lock);
+              }
+
+              ~ggml_vk_srwlock_guard() {
+                  ReleaseSRWLockExclusive(lock);
+              }
+          };
+
+          static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg, size_t device) {
+              GGML_LOG_INFO("[vulkan-legacy] registry lock begin\n");
+              ggml_vk_srwlock_guard lock(&ggml_backend_vk_devices_lock);
+              GGML_LOG_INFO("[vulkan-legacy] registry lock acquired\n");
+
+              if (!ggml_backend_vk_devices_initialized) {
+                  const size_t count = ggml_backend_vk_get_device_count();
+                  GGML_LOG_INFO("[vulkan-legacy] allocating registry for %zu device(s)\n", count);
+                  ggml_backend_vk_devices = new ggml_backend_dev_t[count] {};
+
+                  const int min_batch_size = getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
+                  for (size_t i = 0; i < count; i++) {
+                      ggml_backend_vk_device_context * ctx = new ggml_backend_vk_device_context;
+                      char desc[256];
+                      ggml_backend_vk_get_device_description(i, desc, sizeof(desc));
+                      ctx->device = i;
+                      ctx->name = GGML_VK_NAME + std::to_string(i);
+                      ctx->description = desc;
+                      ctx->is_integrated_gpu = ggml_backend_vk_get_device_type(i) == vk::PhysicalDeviceType::eIntegratedGpu;
+                      ctx->pci_bus_id = ggml_backend_vk_get_device_pci_id(i);
+                      ctx->op_offload_min_batch_size = min_batch_size;
+                      ggml_backend_vk_devices[i] = new ggml_backend_device {
+                          /* .iface   = */ ggml_backend_vk_device_i,
+                          /* .reg     = */ reg,
+                          /* .context = */ ctx,
+                      };
+                  }
+                  ggml_backend_vk_devices_count = count;
+                  ggml_backend_vk_devices_initialized = true;
+                  GGML_LOG_INFO("[vulkan-legacy] registry initialized\n");
+              }
+
+              GGML_ASSERT(device < ggml_backend_vk_devices_count);
+              return ggml_backend_vk_devices[device];
+          }
+          '@
+
+          if (-not $vulkanSource.Contains($oldRegistry)) {
+            throw "Expected Vulkan registry implementation was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldRegistry, $legacyRegistry)
+          Set-Content $vulkanPath $vulkanSource -Encoding UTF8
+
+          $initPath = "src\llama_cpp\__init__.py"
+          $init = Get-Content $initPath -Raw
+          $oldVersion = "__version__ = `"$env:SOURCE_VERSION`""
+          $newVersion = "__version__ = `"$env:PACKAGE_VERSION`""
+          if (-not $init.Contains($oldVersion)) {
+            throw "Expected package version $oldVersion was not found"
+          }
+          $init = $init.Replace($oldVersion, $newVersion)
+          Set-Content $initPath $init -Encoding UTF8
+
+          git -C src diff -- CMakeLists.txt llama_cpp/__init__.py vendor/llama.cpp/src/CMakeLists.txt vendor/llama.cpp/ggml/src/ggml-threading.cpp vendor/llama.cpp/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+
+      - name: Configure optimized Tiger Lake and Vulkan build
+        shell: pwsh
+        run: |
+          $flags = @(
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DBUILD_SHARED_LIBS=OFF",
+            "-DLLAVA_BUILD=OFF",
+            "-DGGML_NATIVE=OFF",
+            "-DGGML_OPENMP=ON",
+            "-DGGML_BACKEND_DL=OFF",
+            "-DGGML_CPU_ALL_VARIANTS=OFF",
+            "-DGGML_CPU_REPACK=ON",
+            "-DGGML_BLAS=OFF",
+            "-DGGML_CUDA=OFF",
+            "-DGGML_HIP=OFF",
+            "-DGGML_SYCL=OFF",
+            "-DGGML_OPENCL=OFF",
+            "-DGGML_RPC=OFF",
+            "-DGGML_METAL=OFF",
+            "-DGGML_VULKAN=ON",
+            "-DGGML_SSE42=ON",
+            "-DGGML_AVX=ON",
+            "-DGGML_AVX2=ON",
+            "-DGGML_FMA=ON",
+            "-DGGML_F16C=ON",
+            "-DGGML_BMI2=ON",
+            "-DGGML_AVX512=ON",
+            "-DGGML_AVX512_VBMI=ON",
+            "-DGGML_AVX512_VNNI=ON",
+            "-DGGML_AVX512_BF16=OFF",
+            "-DLLAMA_BUILD_TESTS=OFF",
+            "-DLLAMA_BUILD_EXAMPLES=OFF",
+            "-DLLAMA_BUILD_TOOLS=OFF",
+            "-DLLAMA_BUILD_SERVER=OFF"
+          )
+
+          $argsLine = $flags -join " "
+          "CMAKE_GENERATOR=Ninja" >> $env:GITHUB_ENV
+          "CMAKE_ARGS=$argsLine" >> $env:GITHUB_ENV
+          Write-Host "CMAKE_ARGS=$argsLine"
+
+      - name: Build wheel
+        shell: pwsh
+        run: |
+          Set-Location src
+          $outDir = Join-Path $env:GITHUB_WORKSPACE "wheelhouse"
+          New-Item -ItemType Directory -Force $outDir | Out-Null
+          python -m build --wheel --outdir $outDir
+
+      - name: Verify packaging, backend, and CPU fallback
+        shell: pwsh
+        run: |
+          $wheel = Get-ChildItem "wheelhouse\*.whl" | Select-Object -First 1
+          if (-not $wheel) {
+            throw "No wheel was produced"
+          }
+
+          python -m venv testenv
+          $testPython = Join-Path $env:GITHUB_WORKSPACE "testenv\Scripts\python.exe"
+          & $testPython -m pip install --upgrade "pip<26"
+          & $testPython -m pip install --no-cache-dir $wheel.FullName
+
+          New-Item -ItemType Directory -Force reports | Out-Null
+          New-Item -ItemType Directory -Force test-model | Out-Null
+          $modelPath = Join-Path $env:GITHUB_WORKSPACE "test-model\stories15M-q4_0.gguf"
+          Invoke-WebRequest -Uri $env:TEST_MODEL_URL -OutFile $modelPath
+          $actualHash = (Get-FileHash $modelPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $env:TEST_MODEL_SHA256) {
+            throw "Test model SHA-256 mismatch: $actualHash"
+          }
+
+          @'
+          import os
+          import platform
+          import sys
+          from pathlib import Path
+
+          import llama_cpp
+          from llama_cpp import Llama
+
+          print("Python:", sys.version)
+          print("Platform:", platform.platform())
+          print("llama-cpp-python:", llama_cpp.__version__)
+
+          print("Calling llama_backend_init()", flush=True)
+          llama_cpp.llama_backend_init()
+          print("BACKEND INIT OK", flush=True)
+          llama_cpp.llama_backend_free()
+          print("BACKEND FREE OK", flush=True)
+
+          os.environ["GGML_DISABLE_VULKAN"] = "1"
+          model_path = Path("test-model/stories15M-q4_0.gguf").resolve()
+          llm = Llama(
+              model_path=str(model_path),
+              n_ctx=128,
+              n_batch=32,
+              n_threads=2,
+              n_gpu_layers=0,
+              verbose=True,
+          )
+          output = llm("Once upon a time", max_tokens=8, temperature=0.0)
+          text = output["choices"][0]["text"]
+          if not isinstance(text, str) or not text:
+              raise RuntimeError(f"Model returned no completion: {output!r}")
+          print("CPU FALLBACK MODEL TEST OK:", repr(text), flush=True)
+          '@ | & $testPython -I -X faulthandler -u 2>&1 |
+            Tee-Object "reports\legacy-vulkan-runtime-test.txt"
+
+          $llamaDll = Join-Path $env:GITHUB_WORKSPACE "testenv\Lib\site-packages\llama_cpp\lib\llama.dll"
+          dumpbin /DEPENDENTS $llamaDll |
+            Tee-Object "reports\legacy-vulkan-dll-dependencies.txt"
+
+      - name: Create reproducibility manifest
+        if: always()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force reports | Out-Null
+          $manifest = "reports\legacy-vulkan-build-manifest.txt"
+          "package_version=$env:PACKAGE_VERSION" | Set-Content $manifest
+          "source_version=$env:SOURCE_VERSION" | Add-Content $manifest
+          "source_commit=$(git -C src rev-parse HEAD)" | Add-Content $manifest
+          "python=$(python --version 2>&1)" | Add-Content $manifest
+          "cmake_args=$env:CMAKE_ARGS" | Add-Content $manifest
+          "core_srwlock_fix=enabled" | Add-Content $manifest
+          "vulkan_registry_pod_state=enabled" | Add-Content $manifest
+          "vulkan_registry_srwlock=enabled" | Add-Content $manifest
+          "submodules:" | Add-Content $manifest
+          git -C src submodule status | Add-Content $manifest
+
+          Get-ChildItem "wheelhouse\*.whl" -ErrorAction SilentlyContinue | ForEach-Object {
+            "wheel=$($_.Name)" | Add-Content $manifest
+            "wheel_size=$($_.Length)" | Add-Content $manifest
+            "wheel_sha256=$((Get-FileHash $_.FullName -Algorithm SHA256).Hash)" | Add-Content $manifest
+          }
+          Get-Content $manifest
+
+      - name: Upload wheel and reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: llama-cpp-python-${{ env.PACKAGE_VERSION }}-win-amd64
+          path: |
+            wheelhouse/*.whl
+            reports/*.txt
+          if-no-files-found: error
+          retention-days: 30
