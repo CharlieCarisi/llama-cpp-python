@@ -376,3 +376,65 @@ jobs:
             reports/*.txt
           if-no-files-found: error
           retention-days: 30
+
+  publish:
+    name: Publish legacy Vulkan prerelease
+    needs: build
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download legacy Vulkan wheel and reports
+        uses: actions/download-artifact@v7
+        with:
+          name: llama-cpp-python-${{ env.PACKAGE_VERSION }}-win-amd64
+          path: release-assets
+
+      - name: Prepare release notes
+        shell: bash
+        run: |
+          cat > release-notes.md <<'EOF'
+          Experimental Windows x64 / Python 3.9 Vulkan compatibility wheel for llama-cpp-python 0.3.34 and legacy Intel Iris Xe driver stacks.
+
+          This build keeps the confirmed GGML SRWLOCK fix and additionally replaces the Vulkan registry's function-local C++ vector and mutex initialization with zero-initialized registry state and a Windows SRWLOCK.
+
+          The GitHub Windows runner validated:
+          - wheel packaging and clean Python 3.9 installation
+          - llama_backend_init() and llama_backend_free()
+          - DLL dependencies
+          - reproducibility manifest and SHA-256
+
+          GitHub's runner has no Vulkan GPU. Actual Vulkan-device initialization and offload must be validated on the target Iris Xe workstation. This is a compatibility prerelease, not a replacement for the stable optimized CPU wheel.
+          EOF
+
+      - name: Create or update public prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: v0.3.34-win39-vulkan-xelegacy-r1
+          RELEASE_TARGET: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          mapfile -d '' assets < <(find release-assets -type f -print0)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "No release assets were downloaded" >&2
+            exit 1
+          fi
+
+          if gh release view "$RELEASE_TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber --repo "$GH_REPO"
+            gh release edit "$RELEASE_TAG" \
+              --repo "$GH_REPO" \
+              --title "$RELEASE_TAG" \
+              --notes-file release-notes.md \
+              --prerelease
+          else
+            gh release create "$RELEASE_TAG" "${assets[@]}" \
+              --repo "$GH_REPO" \
+              --target "$RELEASE_TARGET" \
+              --title "$RELEASE_TAG" \
+              --notes-file release-notes.md \
+              --prerelease
+          fi
