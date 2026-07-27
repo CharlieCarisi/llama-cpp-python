@@ -31,24 +31,22 @@ on:
       - main
     paths:
       - ".github/workflows/build-release-llama.yml"
-      - ".github/workflows/build-init-stage-diagnostics.yml"
+      - ".github/workflows/build-optimized-windows-wheels.yml"
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  conservative-pr:
+  optimized-pr:
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
-    uses: ./.github/workflows/build-init-stage-diagnostics.yml
+    uses: ./.github/workflows/build-optimized-windows-wheels.yml
     with:
       version: "0.3.34"
-      publish_release: true
-      release_tag: "v0.3.34-win39-sync-diagnostic-r4"
     permissions:
-      contents: write
+      contents: read
 
   build-release:
     if: github.event_name == 'workflow_dispatch'
