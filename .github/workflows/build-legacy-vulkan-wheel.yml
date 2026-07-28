@@ -1,7 +1,6 @@
 name: Build legacy Intel Vulkan compatibility wheel
 
 on:
-  workflow_call:
   workflow_dispatch:
 
 permissions:
