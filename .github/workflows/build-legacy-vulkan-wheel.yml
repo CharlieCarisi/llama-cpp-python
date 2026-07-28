@@ -17,7 +17,7 @@ permissions:
 
 env:
   SOURCE_VERSION: "0.3.34"
-  PACKAGE_VERSION: "0.3.34+win.srw.vulkan.xelegacy2"
+  PACKAGE_VERSION: "0.3.34+win.srw.vulkan.xelegacy3"
   VULKAN_SDK_VERSION: "1.4.341.0"
 
 jobs:
@@ -239,6 +239,35 @@ jobs:
           }
           $vulkanSource = $vulkanSource.Replace($oldRegistry, $legacyRegistry)
 
+          $oldVkBufferTypeConstruction = @'
+        device->buffer_type = {
+            /* .iface    = */ ggml_backend_vk_buffer_type_interface,
+            /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), idx),
+            /* .context  = */ new ggml_backend_vk_buffer_type_context{ device->name, device },
+        };
+          '@
+
+          $legacyVkBufferTypeConstruction = @'
+        // The registry device is not available until ggml_vk_get_device() returns.
+        // Leave this temporarily unbound instead of recursively entering the
+        // registry while the Vulkan device and its buffer type are being built.
+        GGML_LOG_INFO("[vulkan-legacy3] raw buffer type construction begin: index=%zu\\n", idx);
+        device->buffer_type = {
+            /* .iface    = */ ggml_backend_vk_buffer_type_interface,
+            /* .device   = */ nullptr,
+            /* .context  = */ new ggml_backend_vk_buffer_type_context{ device->name, device },
+        };
+        GGML_LOG_INFO("[vulkan-legacy3] raw buffer type constructed: buft=%p context=%p device=%p\\n",
+                      (void *) &device->buffer_type,
+                      (void *) device->buffer_type.context,
+                      (void *) device->buffer_type.device);
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkBufferTypeConstruction)) {
+            throw "Expected recursive Vulkan buffer-type construction was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkBufferTypeConstruction, $legacyVkBufferTypeConstruction)
+
           $oldBackendInit = @'
           ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
               VK_LOG_DEBUG("ggml_backend_vk_init(" << dev_num << ")");
@@ -265,12 +294,21 @@ jobs:
           // Internal path used when the backend registry has already resolved the
           // device. Passing that device through avoids a second registry traversal.
           static ggml_backend_t ggml_backend_vk_init_with_device(size_t dev_num, ggml_backend_dev_t backend_device) {
-              GGML_LOG_INFO("[vulkan-legacy2] backend init begin: index=%zu device=%p\n", dev_num, (void *) backend_device);
+              GGML_LOG_INFO("[vulkan-legacy3] backend init begin: index=%zu device=%p\n", dev_num, (void *) backend_device);
 
               ggml_backend_vk_context * ctx = new ggml_backend_vk_context;
-              GGML_LOG_INFO("[vulkan-legacy2] backend context allocated: ctx=%p\n", (void *) ctx);
+              GGML_LOG_INFO("[vulkan-legacy3] backend context allocated: ctx=%p\n", (void *) ctx);
               ggml_vk_init(ctx, dev_num);
-              GGML_LOG_INFO("[vulkan-legacy2] ggml_vk_init complete: vk_device=%p\n", (void *) ctx->device.get());
+              GGML_ASSERT(ctx->device);
+              GGML_LOG_INFO("[vulkan-legacy3] ggml_vk_init complete: vk_device=%p\n", (void *) ctx->device.get());
+
+              // ggml_vk_get_device() now returns without a recursive registry
+              // lookup. Bind its buffer type to the device already resolved by
+              // the caller before any backend allocation can use it.
+              ctx->device->buffer_type.device = backend_device;
+              GGML_LOG_INFO("[vulkan-legacy3] backend buffer type bound: buft=%p device=%p\n",
+                            (void *) &ctx->device->buffer_type,
+                            (void *) ctx->device->buffer_type.device);
 
               ggml_backend_t vk_backend = new ggml_backend {
                   /* .guid    = */ ggml_backend_vk_guid(),
@@ -278,20 +316,20 @@ jobs:
                   /* .device  = */ backend_device,
                   /* .context = */ ctx,
               };
-              GGML_LOG_INFO("[vulkan-legacy2] backend object allocated: backend=%p device=%p\n", (void *) vk_backend, (void *) vk_backend->device);
+              GGML_LOG_INFO("[vulkan-legacy3] backend object allocated: backend=%p device=%p\n", (void *) vk_backend, (void *) vk_backend->device);
 
               if (!ctx->device->support_async) {
                   vk_backend->iface.get_tensor_async = nullptr;
               }
 
-              GGML_LOG_INFO("[vulkan-legacy2] backend init complete\n");
+              GGML_LOG_INFO("[vulkan-legacy3] backend init complete\n");
               return vk_backend;
           }
 
           ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
-              GGML_LOG_INFO("[vulkan-legacy2] public backend init resolving registry device: index=%zu\n", dev_num);
+              GGML_LOG_INFO("[vulkan-legacy3] public backend init resolving registry device: index=%zu\n", dev_num);
               ggml_backend_dev_t backend_device = ggml_backend_reg_dev_get(ggml_backend_vk_reg(), dev_num);
-              GGML_LOG_INFO("[vulkan-legacy2] public backend init resolved device=%p\n", (void *) backend_device);
+              GGML_LOG_INFO("[vulkan-legacy3] public backend init resolved device=%p\n", (void *) backend_device);
               return ggml_backend_vk_init_with_device(dev_num, backend_device);
           }
           '@
@@ -310,12 +348,16 @@ jobs:
 
           $legacyDeviceBufferType = @'
           static ggml_backend_buffer_type_t ggml_backend_vk_device_get_buffer_type(ggml_backend_dev_t dev) {
-              GGML_LOG_INFO("[vulkan-legacy2] buffer type lookup begin: dev=%p\n", (void *) dev);
+              GGML_LOG_INFO("[vulkan-legacy3] buffer type lookup begin: dev=%p\n", (void *) dev);
               ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *) dev->context;
-              GGML_LOG_INFO("[vulkan-legacy2] buffer type context: ctx=%p index=%zu\n", (void *) ctx, ctx->device);
+              GGML_LOG_INFO("[vulkan-legacy3] buffer type context: ctx=%p index=%zu\n", (void *) ctx, ctx->device);
               ggml_backend_buffer_type_t buffer_type = ggml_backend_vk_buffer_type(ctx->device);
-              GGML_LOG_INFO("[vulkan-legacy2] buffer type lookup complete: buft=%p context=%p\n",
-                            (void *) buffer_type, buffer_type ? buffer_type->context : nullptr);
+              GGML_ASSERT(buffer_type);
+              buffer_type->device = dev;
+              GGML_LOG_INFO("[vulkan-legacy3] buffer type lookup complete and bound: buft=%p context=%p device=%p\n",
+                            (void *) buffer_type,
+                            (void *) buffer_type->context,
+                            (void *) buffer_type->device);
               return buffer_type;
           }
           '@
@@ -336,14 +378,14 @@ jobs:
           $legacyDeviceInit = @'
           static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const char * params) {
               UNUSED(params);
-              GGML_LOG_INFO("[vulkan-legacy2] registry device init begin: dev=%p\n", (void *) dev);
+              GGML_LOG_INFO("[vulkan-legacy3] registry device init begin: dev=%p\n", (void *) dev);
               ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *) dev->context;
-              GGML_LOG_INFO("[vulkan-legacy2] registry device init context: ctx=%p index=%zu\n", (void *) ctx, ctx->device);
+              GGML_LOG_INFO("[vulkan-legacy3] registry device init context: ctx=%p index=%zu\n", (void *) ctx, ctx->device);
 
               // The registry already supplied dev. Reuse it directly instead of
               // calling the public initializer, which resolves the registry again.
               ggml_backend_t backend = ggml_backend_vk_init_with_device(ctx->device, dev);
-              GGML_LOG_INFO("[vulkan-legacy2] registry device init complete: backend=%p\n", (void *) backend);
+              GGML_LOG_INFO("[vulkan-legacy3] registry device init complete: backend=%p\n", (void *) backend);
               return backend;
           }
           '@
@@ -471,6 +513,8 @@ jobs:
           "vulkan_registry_pod_state=enabled" | Add-Content $manifest
           "vulkan_registry_srwlock=enabled" | Add-Content $manifest
           "vulkan_direct_registry_device_init=enabled" | Add-Content $manifest
+          "vulkan_preconstruction_registry_lookup=removed" | Add-Content $manifest
+          "vulkan_buffer_type_direct_binding=enabled" | Add-Content $manifest
           "vulkan_buffer_type_checkpoints=enabled" | Add-Content $manifest
           "submodules:" | Add-Content $manifest
           git -C src submodule status | Add-Content $manifest
@@ -514,7 +558,7 @@ jobs:
           cat > release-notes.md <<'EOF'
           Experimental Windows x64 / Python 3.9 Vulkan compatibility wheel for llama-cpp-python 0.3.34 and legacy Intel Iris Xe driver stacks.
 
-          This build keeps the confirmed GGML and Vulkan-registry SRWLOCK fixes. It also passes the already-resolved Vulkan registry device directly into backend construction, avoiding the second registry traversal seen immediately before the target workstation's GPU-offload crash. Buffer-type and backend-construction checkpoints are enabled for the real Iris Xe test.
+          This build keeps the confirmed GGML and Vulkan-registry SRWLOCK fixes. It removes the recursive registry lookup from Vulkan buffer-type construction itself, initially leaves the buffer type unbound, and then binds it directly to the already-resolved registry device before use. Buffer-type and backend-construction checkpoints are enabled for the real Iris Xe test.
 
           The GitHub Windows runner validated:
           - wheel packaging and clean Python 3.9 installation
@@ -530,7 +574,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: v0.3.34-win39-vulkan-xelegacy-r2
+          RELEASE_TAG: v0.3.34-win39-vulkan-xelegacy-r3
           RELEASE_TARGET: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           mapfile -d '' assets < <(find release-assets -type f -print0)
