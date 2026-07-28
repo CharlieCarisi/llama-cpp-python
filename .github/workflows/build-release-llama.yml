@@ -32,6 +32,7 @@ on:
     paths:
       - ".github/workflows/build-release-llama.yml"
       - ".github/workflows/build-optimized-windows-wheels.yml"
+      - ".github/workflows/build-legacy-vulkan-wheel.yml"
 
 permissions:
   contents: read
@@ -47,6 +48,12 @@ jobs:
       version: "0.3.34"
       publish_release: true
       release_tag: "v0.3.34-win39-srw-optimized-r1"
+    permissions:
+      contents: write
+
+  legacy-vulkan-pr:
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    uses: ./.github/workflows/build-legacy-vulkan-wheel.yml
     permissions:
       contents: write
 
