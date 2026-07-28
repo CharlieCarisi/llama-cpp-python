@@ -1,15 +1,7 @@
 name: Build legacy Intel Vulkan compatibility wheel
 
 on:
-  pull_request:
-    types:
-      - opened
-      - synchronize
-      - reopened
-    branches:
-      - main
-    paths:
-      - ".github/workflows/build-legacy-vulkan-wheel.yml"
+  workflow_call:
   workflow_dispatch:
 
 permissions:
