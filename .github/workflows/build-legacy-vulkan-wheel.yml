@@ -1,6 +1,7 @@
 name: Build legacy Intel Vulkan compatibility wheel
 
 on:
+  workflow_call:
   workflow_dispatch:
 
 permissions:
@@ -231,27 +232,27 @@ jobs:
           $vulkanSource = $vulkanSource.Replace($oldRegistry, $legacyRegistry)
 
           $oldVkBufferTypeConstruction = @'
-        device->buffer_type = {
-            /* .iface    = */ ggml_backend_vk_buffer_type_interface,
-            /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), idx),
-            /* .context  = */ new ggml_backend_vk_buffer_type_context{ device->name, device },
-        };
+                  device->buffer_type = {
+                      /* .iface    = */ ggml_backend_vk_buffer_type_interface,
+                      /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), idx),
+                      /* .context  = */ new ggml_backend_vk_buffer_type_context{ device->name, device },
+                  };
           '@
 
           $legacyVkBufferTypeConstruction = @'
-        // The registry device is not available until ggml_vk_get_device() returns.
-        // Leave this temporarily unbound instead of recursively entering the
-        // registry while the Vulkan device and its buffer type are being built.
-        GGML_LOG_INFO("[vulkan-legacy3] raw buffer type construction begin: index=%zu\\n", idx);
-        device->buffer_type = {
-            /* .iface    = */ ggml_backend_vk_buffer_type_interface,
-            /* .device   = */ nullptr,
-            /* .context  = */ new ggml_backend_vk_buffer_type_context{ device->name, device },
-        };
-        GGML_LOG_INFO("[vulkan-legacy3] raw buffer type constructed: buft=%p context=%p device=%p\\n",
-                      (void *) &device->buffer_type,
-                      (void *) device->buffer_type.context,
-                      (void *) device->buffer_type.device);
+                  // The registry device is not available until ggml_vk_get_device() returns.
+                  // Leave this temporarily unbound instead of recursively entering the
+                  // registry while the Vulkan device and its buffer type are being built.
+                  GGML_LOG_INFO("[vulkan-legacy3] raw buffer type construction begin: index=%zu\n", idx);
+                  device->buffer_type = {
+                      /* .iface    = */ ggml_backend_vk_buffer_type_interface,
+                      /* .device   = */ nullptr,
+                      /* .context  = */ new ggml_backend_vk_buffer_type_context{ device->name, device },
+                  };
+                  GGML_LOG_INFO("[vulkan-legacy3] raw buffer type constructed: buft=%p context=%p device=%p\n",
+                                (void *) &device->buffer_type,
+                                (void *) device->buffer_type.context,
+                                (void *) device->buffer_type.device);
           '@
 
           if (-not $vulkanSource.Contains($oldVkBufferTypeConstruction)) {
