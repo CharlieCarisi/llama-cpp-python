@@ -9,7 +9,7 @@ permissions:
 
 env:
   SOURCE_VERSION: "0.3.34"
-  PACKAGE_VERSION: "0.3.34+win.srw.vulkan.xelegacy4"
+  PACKAGE_VERSION: "0.3.34+win.srw.vulkan.xelegacy5"
   VULKAN_SDK_VERSION: "1.4.341.0"
 
 jobs:
@@ -222,7 +222,7 @@ jobs:
               }
 
               GGML_ASSERT(device < ggml_backend_vk_devices_count);
-              GGML_LOG_INFO("[vulkan-legacy4] registry return: index=%zu count=%zu device=%p\n",
+              GGML_LOG_INFO("[vulkan-legacy5] registry return: index=%zu count=%zu device=%p\n",
                             device,
                             ggml_backend_vk_devices_count,
                             (void *) ggml_backend_vk_devices[device]);
@@ -234,6 +234,218 @@ jobs:
             throw "Expected Vulkan registry implementation was not found"
           }
           $vulkanSource = $vulkanSource.Replace($oldRegistry, $legacyRegistry)
+
+          # Use the smallest practical Vulkan feature surface on the target
+          # 2022 Intel Xe driver and add checkpoints inside full device creation.
+          $oldVkDeviceEntry = @'
+          static vk_device ggml_vk_get_device(size_t idx) {
+              VK_LOG_DEBUG("ggml_vk_get_device(" << idx << ")");
+
+              if (vk_instance.devices[idx] == nullptr) {
+                  VK_LOG_DEBUG("Initializing new vk_device");
+                  vk_device device = std::make_shared<vk_device_struct>();
+                  vk_instance.devices[idx] = device;
+
+                  device->memory_logger = std::unique_ptr<vk_memory_logger>(new vk_memory_logger());
+
+                  size_t dev_num = vk_instance.device_indices[idx];
+
+                  std::vector<vk::PhysicalDevice> physical_devices = vk_instance.instance.enumeratePhysicalDevices();
+          '@
+
+          $legacyVkDeviceEntry = @'
+          static vk_device ggml_vk_get_device(size_t idx) {
+              VK_LOG_DEBUG("ggml_vk_get_device(" << idx << ")");
+              GGML_LOG_INFO("[vulkan-legacy5] device init entry: index=%zu selected_count=%zu\n",
+                            idx, vk_instance.device_indices.size());
+              GGML_ASSERT(idx < GGML_VK_MAX_DEVICES);
+              GGML_ASSERT(idx < vk_instance.device_indices.size());
+              GGML_LOG_INFO("[vulkan-legacy5] device cache probe begin\n");
+
+              if (vk_instance.devices[idx] == nullptr) {
+                  GGML_LOG_INFO("[vulkan-legacy5] device cache empty; allocating device state\n");
+                  vk_device device = std::make_shared<vk_device_struct>();
+                  vk_instance.devices[idx] = device;
+                  GGML_LOG_INFO("[vulkan-legacy5] device state allocated: device=%p\n", (void *) device.get());
+
+                  device->memory_logger = std::unique_ptr<vk_memory_logger>(new vk_memory_logger());
+                  GGML_LOG_INFO("[vulkan-legacy5] memory logger allocated\n");
+
+                  size_t dev_num = vk_instance.device_indices[idx];
+                  GGML_LOG_INFO("[vulkan-legacy5] physical device ordinal=%zu\n", dev_num);
+
+                  GGML_LOG_INFO("[vulkan-legacy5] physical device enumeration begin\n");
+                  std::vector<vk::PhysicalDevice> physical_devices = vk_instance.instance.enumeratePhysicalDevices();
+                  GGML_LOG_INFO("[vulkan-legacy5] physical device enumeration complete: count=%zu\n",
+                                physical_devices.size());
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkDeviceEntry)) {
+            throw "Expected Vulkan device-entry implementation was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkDeviceEntry, $legacyVkDeviceEntry)
+
+          $oldVkPhysicalDeviceSetup = @'
+                  device->physical_device = physical_devices[dev_num];
+                  const std::vector<vk::ExtensionProperties> ext_props = device->physical_device.enumerateDeviceExtensionProperties();
+
+                  device->architecture = get_device_architecture(device->physical_device);
+          '@
+
+          $legacyVkPhysicalDeviceSetup = @'
+                  device->physical_device = physical_devices[dev_num];
+                  GGML_LOG_INFO("[vulkan-legacy5] extension enumeration begin\n");
+                  const std::vector<vk::ExtensionProperties> ext_props = device->physical_device.enumerateDeviceExtensionProperties();
+                  GGML_LOG_INFO("[vulkan-legacy5] extension enumeration complete: count=%zu\n", ext_props.size());
+
+                  device->architecture = get_device_architecture(device->physical_device);
+                  GGML_LOG_INFO("[vulkan-legacy5] architecture resolved: value=%d\n", (int) device->architecture);
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkPhysicalDeviceSetup)) {
+            throw "Expected Vulkan physical-device setup was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkPhysicalDeviceSetup, $legacyVkPhysicalDeviceSetup)
+
+          $oldVkPropertiesAnchor = @'
+                  }
+
+                  vk::PhysicalDeviceProperties2 props2;
+                  vk::PhysicalDeviceMaintenance3Properties props3;
+          '@
+
+          $legacyVkPropertiesAnchor = @'
+                  }
+
+                  // Legacy Intel compatibility profile. Keep required 16-bit
+                  // storage and FP16, but do not enable optional extension paths
+                  // known to vary substantially across old Windows drivers.
+                  maintenance4_support = false;
+                  sm_builtins = false;
+                  amd_shader_core_properties2 = false;
+                  pipeline_robustness = false;
+                  coopmat2_support = false;
+                  coopmat2_decode_vector_support = false;
+                  pipeline_executable_properties_support = false;
+                  device->subgroup_size_control = false;
+                  device->coopmat_support = false;
+                  device->integer_dot_product = false;
+                  device->external_memory_host = false;
+                  device->shader_64b_indexing = false;
+                  device->memory_priority = false;
+                  bfloat16_support = false;
+                  dot2_f16_support = false;
+                  GGML_LOG_INFO("[vulkan-legacy5] minimal Intel feature profile applied\n");
+
+                  vk::PhysicalDeviceProperties2 props2;
+                  vk::PhysicalDeviceMaintenance3Properties props3;
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkPropertiesAnchor)) {
+            throw "Expected Vulkan properties anchor was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkPropertiesAnchor, $legacyVkPropertiesAnchor)
+
+          $oldVkPropertiesQuery = @'
+                  device->physical_device.getProperties2(&props2);
+                  device->properties = props2.properties;
+          '@
+
+          $legacyVkPropertiesQuery = @'
+                  GGML_LOG_INFO("[vulkan-legacy5] physical properties query begin\n");
+                  device->physical_device.getProperties2(&props2);
+                  GGML_LOG_INFO("[vulkan-legacy5] physical properties query complete\n");
+                  device->properties = props2.properties;
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkPropertiesQuery)) {
+            throw "Expected Vulkan physical-properties query was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkPropertiesQuery, $legacyVkPropertiesQuery)
+
+          $oldVkAsyncSelection = @'
+                  device->support_async = (device->vendor_id != VK_VENDOR_ID_INTEL ||
+                                           std::string(device->properties.deviceName.data()).find("(DG1)") == std::string::npos) &&
+                                          getenv("GGML_VK_DISABLE_ASYNC") == nullptr;
+          '@
+
+          $legacyVkAsyncSelection = @'
+                  // The legacy compatibility wheel intentionally uses the
+                  // synchronous backend path on Intel Xe.
+                  device->support_async = false;
+                  GGML_LOG_INFO("[vulkan-legacy5] async backend disabled\n");
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkAsyncSelection)) {
+            throw "Expected Vulkan async-selection implementation was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkAsyncSelection, $legacyVkAsyncSelection)
+
+          $oldVkFeaturesQuery = @'
+                  vkGetPhysicalDeviceFeatures2(device->physical_device, &device_features2);
+
+                  device->pipeline_executable_properties_support = pipeline_executable_properties_support;
+          '@
+
+          $legacyVkFeaturesQuery = @'
+                  GGML_LOG_INFO("[vulkan-legacy5] physical features query begin\n");
+                  vkGetPhysicalDeviceFeatures2(device->physical_device, &device_features2);
+                  GGML_LOG_INFO("[vulkan-legacy5] physical features query complete\n");
+
+                  device->pipeline_executable_properties_support = pipeline_executable_properties_support;
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkFeaturesQuery)) {
+            throw "Expected Vulkan physical-features query was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkFeaturesQuery, $legacyVkFeaturesQuery)
+
+          $oldVkCreateDevice = @'
+                  device_create_info.setPNext(&device_features2);
+                  device->device = device->physical_device.createDevice(device_create_info);
+
+                  // Queues
+                  ggml_vk_create_queue(device, device->compute_queue, compute_queue_family_index, 0, { vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer }, false);
+          '@
+
+          $legacyVkCreateDevice = @'
+                  device_create_info.setPNext(&device_features2);
+                  GGML_LOG_INFO("[vulkan-legacy5] logical device creation begin: extensions=%zu\n",
+                                device_extensions.size());
+                  device->device = device->physical_device.createDevice(device_create_info);
+                  GGML_LOG_INFO("[vulkan-legacy5] logical device creation complete\n");
+
+                  // Queues
+                  GGML_LOG_INFO("[vulkan-legacy5] compute queue creation begin\n");
+                  ggml_vk_create_queue(device, device->compute_queue, compute_queue_family_index, 0, { vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer }, false);
+                  GGML_LOG_INFO("[vulkan-legacy5] compute queue creation complete\n");
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkCreateDevice)) {
+            throw "Expected Vulkan logical-device creation was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkCreateDevice, $legacyVkCreateDevice)
+
+          $oldVkDescriptorAndShaders = @'
+                  device->dsl = device->device.createDescriptorSetLayout(descriptor_set_layout_create_info);
+
+                  ggml_vk_load_shaders(device);
+          '@
+
+          $legacyVkDescriptorAndShaders = @'
+                  GGML_LOG_INFO("[vulkan-legacy5] descriptor layout creation begin\n");
+                  device->dsl = device->device.createDescriptorSetLayout(descriptor_set_layout_create_info);
+                  GGML_LOG_INFO("[vulkan-legacy5] descriptor layout creation complete\n");
+
+                  GGML_LOG_INFO("[vulkan-legacy5] shader loading begin\n");
+                  ggml_vk_load_shaders(device);
+                  GGML_LOG_INFO("[vulkan-legacy5] shader loading complete\n");
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkDescriptorAndShaders)) {
+            throw "Expected Vulkan descriptor/shader initialization was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkDescriptorAndShaders, $legacyVkDescriptorAndShaders)
 
           $oldVkBufferTypeConstruction = @'
                   device->buffer_type = {
@@ -247,13 +459,13 @@ jobs:
                   // The registry device is not available until ggml_vk_get_device() returns.
                   // Leave this temporarily unbound instead of recursively entering the
                   // registry while the Vulkan device and its buffer type are being built.
-                  GGML_LOG_INFO("[vulkan-legacy4] raw buffer type construction begin: index=%zu\n", idx);
+                  GGML_LOG_INFO("[vulkan-legacy5] raw buffer type construction begin: index=%zu\n", idx);
                   device->buffer_type = {
                       /* .iface    = */ ggml_backend_vk_buffer_type_interface,
                       /* .device   = */ nullptr,
                       /* .context  = */ new ggml_backend_vk_buffer_type_context{ device->name, device },
                   };
-                  GGML_LOG_INFO("[vulkan-legacy4] raw buffer type constructed: buft=%p context=%p device=%p\n",
+                  GGML_LOG_INFO("[vulkan-legacy5] raw buffer type constructed: buft=%p context=%p device=%p\n",
                                 (void *) &device->buffer_type,
                                 (void *) device->buffer_type.context,
                                 (void *) device->buffer_type.device);
@@ -290,19 +502,19 @@ jobs:
           // Internal path used when the backend registry has already resolved the
           // device. Passing that device through avoids a second registry traversal.
           static ggml_backend_t ggml_backend_vk_init_with_device(size_t dev_num, ggml_backend_dev_t backend_device) {
-              GGML_LOG_INFO("[vulkan-legacy4] backend init begin: index=%zu device=%p\n", dev_num, (void *) backend_device);
+              GGML_LOG_INFO("[vulkan-legacy5] backend init begin: index=%zu device=%p\n", dev_num, (void *) backend_device);
 
               ggml_backend_vk_context * ctx = new ggml_backend_vk_context;
-              GGML_LOG_INFO("[vulkan-legacy4] backend context allocated: ctx=%p\n", (void *) ctx);
+              GGML_LOG_INFO("[vulkan-legacy5] backend context allocated: ctx=%p\n", (void *) ctx);
               ggml_vk_init(ctx, dev_num);
               GGML_ASSERT(ctx->device);
-              GGML_LOG_INFO("[vulkan-legacy4] ggml_vk_init complete: vk_device=%p\n", (void *) ctx->device.get());
+              GGML_LOG_INFO("[vulkan-legacy5] ggml_vk_init complete: vk_device=%p\n", (void *) ctx->device.get());
 
               // ggml_vk_get_device() now returns without a recursive registry
               // lookup. Bind its buffer type to the device already resolved by
               // the caller before any backend allocation can use it.
               ctx->device->buffer_type.device = backend_device;
-              GGML_LOG_INFO("[vulkan-legacy4] backend buffer type bound: buft=%p device=%p\n",
+              GGML_LOG_INFO("[vulkan-legacy5] backend buffer type bound: buft=%p device=%p\n",
                             (void *) &ctx->device->buffer_type,
                             (void *) ctx->device->buffer_type.device);
 
@@ -312,20 +524,20 @@ jobs:
                   /* .device  = */ backend_device,
                   /* .context = */ ctx,
               };
-              GGML_LOG_INFO("[vulkan-legacy4] backend object allocated: backend=%p device=%p\n", (void *) vk_backend, (void *) vk_backend->device);
+              GGML_LOG_INFO("[vulkan-legacy5] backend object allocated: backend=%p device=%p\n", (void *) vk_backend, (void *) vk_backend->device);
 
               if (!ctx->device->support_async) {
                   vk_backend->iface.get_tensor_async = nullptr;
               }
 
-              GGML_LOG_INFO("[vulkan-legacy4] backend init complete\n");
+              GGML_LOG_INFO("[vulkan-legacy5] backend init complete\n");
               return vk_backend;
           }
 
           ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
-              GGML_LOG_INFO("[vulkan-legacy4] public backend init resolving registry device: index=%zu\n", dev_num);
+              GGML_LOG_INFO("[vulkan-legacy5] public backend init resolving registry device: index=%zu\n", dev_num);
               ggml_backend_dev_t backend_device = ggml_backend_reg_dev_get(ggml_backend_vk_reg(), dev_num);
-              GGML_LOG_INFO("[vulkan-legacy4] public backend init resolved device=%p\n", (void *) backend_device);
+              GGML_LOG_INFO("[vulkan-legacy5] public backend init resolved device=%p\n", (void *) backend_device);
               return ggml_backend_vk_init_with_device(dev_num, backend_device);
           }
           '@
@@ -344,13 +556,13 @@ jobs:
 
           $legacyDeviceBufferType = @'
           static ggml_backend_buffer_type_t ggml_backend_vk_device_get_buffer_type(ggml_backend_dev_t dev) {
-              GGML_LOG_INFO("[vulkan-legacy4] buffer type lookup begin: dev=%p\n", (void *) dev);
+              GGML_LOG_INFO("[vulkan-legacy5] buffer type lookup begin: dev=%p\n", (void *) dev);
               ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *) dev->context;
-              GGML_LOG_INFO("[vulkan-legacy4] buffer type context: ctx=%p index=%zu\n", (void *) ctx, ctx->device);
+              GGML_LOG_INFO("[vulkan-legacy5] buffer type context: ctx=%p index=%zu\n", (void *) ctx, ctx->device);
               ggml_backend_buffer_type_t buffer_type = ggml_backend_vk_buffer_type(ctx->device);
               GGML_ASSERT(buffer_type);
               buffer_type->device = dev;
-              GGML_LOG_INFO("[vulkan-legacy4] buffer type lookup complete and bound: buft=%p context=%p device=%p\n",
+              GGML_LOG_INFO("[vulkan-legacy5] buffer type lookup complete and bound: buft=%p context=%p device=%p\n",
                             (void *) buffer_type,
                             (void *) buffer_type->context,
                             (void *) buffer_type->device);
@@ -378,7 +590,7 @@ jobs:
           // Vulkan model-layer offload.
           static ggml_backend_buffer_type_t ggml_backend_vk_device_get_host_buffer_type(ggml_backend_dev_t dev) {
               UNUSED(dev);
-              GGML_LOG_INFO("[vulkan-legacy4] pinned host buffer disabled; using CPU host-buffer fallback\n");
+              GGML_LOG_INFO("[vulkan-legacy5] pinned host buffer disabled; using CPU host-buffer fallback\n");
               return nullptr;
           }
           '@
@@ -407,14 +619,14 @@ jobs:
           $legacyDeviceInit = @'
           static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const char * params) {
               UNUSED(params);
-              GGML_LOG_INFO("[vulkan-legacy4] registry device init begin: dev=%p\n", (void *) dev);
+              GGML_LOG_INFO("[vulkan-legacy5] registry device init begin: dev=%p\n", (void *) dev);
               ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *) dev->context;
-              GGML_LOG_INFO("[vulkan-legacy4] registry device init context: ctx=%p index=%zu\n", (void *) ctx, ctx->device);
+              GGML_LOG_INFO("[vulkan-legacy5] registry device init context: ctx=%p index=%zu\n", (void *) ctx, ctx->device);
 
               // The registry already supplied dev. Reuse it directly instead of
               // calling the public initializer, which resolves the registry again.
               ggml_backend_t backend = ggml_backend_vk_init_with_device(ctx->device, dev);
-              GGML_LOG_INFO("[vulkan-legacy4] registry device init complete: backend=%p\n", (void *) backend);
+              GGML_LOG_INFO("[vulkan-legacy5] registry device init complete: backend=%p\n", (void *) backend);
               return backend;
           }
           '@
@@ -546,6 +758,10 @@ jobs:
           "vulkan_buffer_type_direct_binding=enabled" | Add-Content $manifest
           "vulkan_buffer_type_checkpoints=enabled" | Add-Content $manifest
           "vulkan_pinned_host_buffer=disabled" | Add-Content $manifest
+          "vulkan_minimal_intel_feature_profile=enabled" | Add-Content $manifest
+          "vulkan_optional_extensions=disabled" | Add-Content $manifest
+          "vulkan_async_backend=disabled" | Add-Content $manifest
+          "vulkan_device_init_checkpoints=enabled" | Add-Content $manifest
           "vulkan_cpu_host_buffer_fallback=enabled" | Add-Content $manifest
           "vulkan_registry_return_checkpoints=enabled" | Add-Content $manifest
           "submodules:" | Add-Content $manifest
@@ -590,7 +806,7 @@ jobs:
           cat > release-notes.md <<'EOF'
           Experimental Windows x64 / Python 3.9 Vulkan compatibility wheel for llama-cpp-python 0.3.34 and legacy Intel Iris Xe driver stacks.
 
-          This build keeps the confirmed GGML and Vulkan-registry SRWLOCK fixes and the direct registry-device binding from xelegacy3. It disables Vulkan's optional pinned host-buffer path, which still recursively entered the registry during make_cpu_buft_list() on the target system. llama.cpp therefore uses its normal CPU host-buffer fallback while Vulkan remains enabled for model-layer offload. Registry-return, buffer-type, and backend-construction checkpoints are enabled for the real Iris Xe test.
+          This build keeps the confirmed GGML and Vulkan-registry SRWLOCK fixes, direct registry-device binding, and CPU host-buffer fallback from xelegacy4. It also applies a minimal Intel Xe feature profile for the 2022 Windows driver: required 16-bit storage and FP16 remain enabled, while optional cooperative-matrix, integer-dot, external-host-memory, subgroup-control, pipeline-introspection, and async paths are disabled. Full device-creation checkpoints are enabled for the real Iris Xe test.
 
           The GitHub Windows runner validated:
           - wheel packaging and clean Python 3.9 installation
@@ -606,7 +822,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: v0.3.34-win39-vulkan-xelegacy-r4
+          RELEASE_TAG: v0.3.34-win39-vulkan-xelegacy-r5
           RELEASE_TARGET: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           mapfile -d '' assets < <(find release-assets -type f -print0)
