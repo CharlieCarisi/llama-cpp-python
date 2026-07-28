@@ -39,6 +39,9 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  SOURCE_VERSION: "0.3.34"
+  PACKAGE_VERSION: "0.3.34+win.srw.vulkan.xelegacy3"
+  VULKAN_SDK_VERSION: "1.4.341.0"
 
 jobs:
   optimized-pr:
@@ -51,11 +54,584 @@ jobs:
     permissions:
       contents: write
 
-  legacy-vulkan-pr:
+  legacy-build:
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
-    uses: ./.github/workflows/build-legacy-vulkan-wheel.yml
+    name: legacy-vulkan-irisxe
+    runs-on: windows-2022
+
+    steps:
+      - name: Set up MSVC x64
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Set up Python 3.9 x64
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.9"
+          architecture: x64
+
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: |
+          choco install vulkan-sdk --version="$env:VULKAN_SDK_VERSION" --no-progress -y
+          $sdk = Join-Path "C:\VulkanSDK" $env:VULKAN_SDK_VERSION
+          if (-not (Test-Path $sdk)) {
+            throw "Vulkan SDK was not found at $sdk"
+          }
+          "VULKAN_SDK=$sdk" >> $env:GITHUB_ENV
+          "$sdk\Bin" >> $env:GITHUB_PATH
+          & "$sdk\Bin\glslc.exe" --version
+
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade "pip<26"
+          python -m pip install build wheel ninja
+
+      - name: Clone exact upstream release
+        shell: pwsh
+        run: |
+          $tag = "v$env:SOURCE_VERSION"
+          git clone --branch $tag --depth 1 --recurse-submodules --shallow-submodules https://github.com/abetlen/llama-cpp-python.git src
+          git -C src rev-parse HEAD
+          git -C src submodule status
+
+      - name: Apply monolithic layout and Windows compatibility fixes
+        shell: pwsh
+        run: |
+          $pythonCmakePath = "src\CMakeLists.txt"
+          $pythonCmake = Get-Content $pythonCmakePath -Raw
+          $sharedSetting = 'set(BUILD_SHARED_LIBS "On")'
+          if (-not $pythonCmake.Contains($sharedSetting)) {
+            throw "Expected BUILD_SHARED_LIBS setting was not found"
+          }
+          $pythonCmake = $pythonCmake.Replace(
+            $sharedSetting,
+            'set(BUILD_SHARED_LIBS "Off")'
+          )
+
+          $ggmlRuntimeInstalls = [regex]'(?ms)\s*install\(\s*FILES \$<TARGET_RUNTIME_DLLS:ggml>\s*DESTINATION [^\r\n]+\s*\)'
+          $ggmlRuntimeInstallMatches = $ggmlRuntimeInstalls.Matches($pythonCmake)
+          if ($ggmlRuntimeInstallMatches.Count -ne 2) {
+            throw "Expected two ggml runtime-DLL install rules, found $($ggmlRuntimeInstallMatches.Count)"
+          }
+          $pythonCmake = $ggmlRuntimeInstalls.Replace($pythonCmake, "")
+          Set-Content $pythonCmakePath $pythonCmake -Encoding UTF8
+
+          $llamaCmakePath = "src\vendor\llama.cpp\src\CMakeLists.txt"
+          $llamaCmake = Get-Content $llamaCmakePath -Raw
+          $addLlama = [regex]'add_library\(llama\s*\r?\n'
+          if (-not $addLlama.IsMatch($llamaCmake)) {
+            throw "Expected add_library(llama) declaration was not found"
+          }
+          $llamaCmake = $addLlama.Replace(
+            $llamaCmake,
+            "add_library(llama SHARED`r`n",
+            1
+          )
+          Set-Content $llamaCmakePath $llamaCmake -Encoding UTF8
+
+          $threadingPath = "src\vendor\llama.cpp\ggml\src\ggml-threading.cpp"
+          $threadingSource = Get-Content $threadingPath -Raw
+          $oldThreading = @'
+          #include "ggml-threading.h"
+          #include <mutex>
+
+          std::mutex ggml_critical_section_mutex;
+
+          void ggml_critical_section_start() {
+              ggml_critical_section_mutex.lock();
+          }
+
+          void ggml_critical_section_end(void) {
+              ggml_critical_section_mutex.unlock();
+          }
+          '@
+
+          $srwThreading = @'
+          #include "ggml-threading.h"
+
+          #define WIN32_LEAN_AND_MEAN
+          #include <windows.h>
+
+          static SRWLOCK ggml_critical_section_lock = SRWLOCK_INIT;
+
+          void ggml_critical_section_start(void) {
+              AcquireSRWLockExclusive(&ggml_critical_section_lock);
+          }
+
+          void ggml_critical_section_end(void) {
+              ReleaseSRWLockExclusive(&ggml_critical_section_lock);
+          }
+          '@
+
+          if (-not $threadingSource.Contains($oldThreading)) {
+            throw "Expected ggml-threading.cpp implementation was not found"
+          }
+          $threadingSource = $threadingSource.Replace($oldThreading, $srwThreading)
+          Set-Content $threadingPath $threadingSource -Encoding UTF8
+
+          $vulkanPath = "src\vendor\llama.cpp\ggml\src\ggml-vulkan\ggml-vulkan.cpp"
+          $vulkanSource = Get-Content $vulkanPath -Raw
+          $oldRegistry = @'
+          static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg, size_t device) {
+              static std::vector<ggml_backend_dev_t> devices;
+
+              static bool initialized = false;
+
+              {
+                  static std::mutex mutex;
+                  std::lock_guard<std::mutex> lock(mutex);
+                  if (!initialized) {
+                      const int min_batch_size = getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
+                      for (int i = 0; i < ggml_backend_vk_get_device_count(); i++) {
+                          ggml_backend_vk_device_context * ctx = new ggml_backend_vk_device_context;
+                          char desc[256];
+                          ggml_backend_vk_get_device_description(i, desc, sizeof(desc));
+                          ctx->device = i;
+                          ctx->name = GGML_VK_NAME + std::to_string(i);
+                          ctx->description = desc;
+                          ctx->is_integrated_gpu = ggml_backend_vk_get_device_type(i) == vk::PhysicalDeviceType::eIntegratedGpu;
+                          ctx->pci_bus_id = ggml_backend_vk_get_device_pci_id(i);
+                          ctx->op_offload_min_batch_size = min_batch_size;
+                          devices.push_back(new ggml_backend_device {
+                              /* .iface   = */ ggml_backend_vk_device_i,
+                              /* .reg     = */ reg,
+                              /* .context = */ ctx,
+                          });
+                      }
+                      initialized = true;
+                  }
+              }
+
+              GGML_ASSERT(device < devices.size());
+              return devices[device];
+          }
+          '@
+
+          $legacyRegistry = @'
+          // Keep registry state in zero-initialized POD values. This avoids the
+          // function-local std::vector and std::mutex initialization paths that
+          // fault on the target Windows/Python 3.9 + legacy Intel driver stack.
+          static SRWLOCK ggml_backend_vk_devices_lock = SRWLOCK_INIT;
+          static ggml_backend_dev_t * ggml_backend_vk_devices = nullptr;
+          static size_t ggml_backend_vk_devices_count = 0;
+          static bool ggml_backend_vk_devices_initialized = false;
+
+          struct ggml_vk_srwlock_guard {
+              SRWLOCK * lock;
+
+              explicit ggml_vk_srwlock_guard(SRWLOCK * lock) : lock(lock) {
+                  AcquireSRWLockExclusive(lock);
+              }
+
+              ~ggml_vk_srwlock_guard() {
+                  ReleaseSRWLockExclusive(lock);
+              }
+          };
+
+          static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg, size_t device) {
+              GGML_LOG_INFO("[vulkan-legacy] registry lock begin\n");
+              ggml_vk_srwlock_guard lock(&ggml_backend_vk_devices_lock);
+              GGML_LOG_INFO("[vulkan-legacy] registry lock acquired\n");
+
+              if (!ggml_backend_vk_devices_initialized) {
+                  const size_t count = ggml_backend_vk_get_device_count();
+                  GGML_LOG_INFO("[vulkan-legacy] allocating registry for %zu device(s)\n", count);
+                  ggml_backend_vk_devices = new ggml_backend_dev_t[count] {};
+
+                  const int min_batch_size = getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
+                  for (size_t i = 0; i < count; i++) {
+                      ggml_backend_vk_device_context * ctx = new ggml_backend_vk_device_context;
+                      char desc[256];
+                      ggml_backend_vk_get_device_description(i, desc, sizeof(desc));
+                      ctx->device = i;
+                      ctx->name = GGML_VK_NAME + std::to_string(i);
+                      ctx->description = desc;
+                      ctx->is_integrated_gpu = ggml_backend_vk_get_device_type(i) == vk::PhysicalDeviceType::eIntegratedGpu;
+                      ctx->pci_bus_id = ggml_backend_vk_get_device_pci_id(i);
+                      ctx->op_offload_min_batch_size = min_batch_size;
+                      ggml_backend_vk_devices[i] = new ggml_backend_device {
+                          /* .iface   = */ ggml_backend_vk_device_i,
+                          /* .reg     = */ reg,
+                          /* .context = */ ctx,
+                      };
+                  }
+                  ggml_backend_vk_devices_count = count;
+                  ggml_backend_vk_devices_initialized = true;
+                  GGML_LOG_INFO("[vulkan-legacy] registry initialized\n");
+              }
+
+              GGML_ASSERT(device < ggml_backend_vk_devices_count);
+              return ggml_backend_vk_devices[device];
+          }
+          '@
+
+          if (-not $vulkanSource.Contains($oldRegistry)) {
+            throw "Expected Vulkan registry implementation was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldRegistry, $legacyRegistry)
+
+          $oldVkBufferTypeConstruction = @'
+        device->buffer_type = {
+            /* .iface    = */ ggml_backend_vk_buffer_type_interface,
+            /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), idx),
+            /* .context  = */ new ggml_backend_vk_buffer_type_context{ device->name, device },
+        };
+          '@
+
+          $legacyVkBufferTypeConstruction = @'
+        // The registry device is not available until ggml_vk_get_device() returns.
+        // Leave this temporarily unbound instead of recursively entering the
+        // registry while the Vulkan device and its buffer type are being built.
+        GGML_LOG_INFO("[vulkan-legacy3] raw buffer type construction begin: index=%zu\\n", idx);
+        device->buffer_type = {
+            /* .iface    = */ ggml_backend_vk_buffer_type_interface,
+            /* .device   = */ nullptr,
+            /* .context  = */ new ggml_backend_vk_buffer_type_context{ device->name, device },
+        };
+        GGML_LOG_INFO("[vulkan-legacy3] raw buffer type constructed: buft=%p context=%p device=%p\\n",
+                      (void *) &device->buffer_type,
+                      (void *) device->buffer_type.context,
+                      (void *) device->buffer_type.device);
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkBufferTypeConstruction)) {
+            throw "Expected recursive Vulkan buffer-type construction was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkBufferTypeConstruction, $legacyVkBufferTypeConstruction)
+
+          $oldBackendInit = @'
+          ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
+              VK_LOG_DEBUG("ggml_backend_vk_init(" << dev_num << ")");
+
+              ggml_backend_vk_context * ctx = new ggml_backend_vk_context;
+              ggml_vk_init(ctx, dev_num);
+
+              ggml_backend_t vk_backend = new ggml_backend {
+                  /* .guid    = */ ggml_backend_vk_guid(),
+                  /* .iface   = */ ggml_backend_vk_interface,
+                  /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), dev_num),
+                  /* .context = */ ctx,
+              };
+
+              if (!ctx->device->support_async) {
+                  vk_backend->iface.get_tensor_async = nullptr;
+              }
+
+              return vk_backend;
+          }
+          '@
+
+          $legacyBackendInit = @'
+          // Internal path used when the backend registry has already resolved the
+          // device. Passing that device through avoids a second registry traversal.
+          static ggml_backend_t ggml_backend_vk_init_with_device(size_t dev_num, ggml_backend_dev_t backend_device) {
+              GGML_LOG_INFO("[vulkan-legacy3] backend init begin: index=%zu device=%p\n", dev_num, (void *) backend_device);
+
+              ggml_backend_vk_context * ctx = new ggml_backend_vk_context;
+              GGML_LOG_INFO("[vulkan-legacy3] backend context allocated: ctx=%p\n", (void *) ctx);
+              ggml_vk_init(ctx, dev_num);
+              GGML_ASSERT(ctx->device);
+              GGML_LOG_INFO("[vulkan-legacy3] ggml_vk_init complete: vk_device=%p\n", (void *) ctx->device.get());
+
+              // ggml_vk_get_device() now returns without a recursive registry
+              // lookup. Bind its buffer type to the device already resolved by
+              // the caller before any backend allocation can use it.
+              ctx->device->buffer_type.device = backend_device;
+              GGML_LOG_INFO("[vulkan-legacy3] backend buffer type bound: buft=%p device=%p\n",
+                            (void *) &ctx->device->buffer_type,
+                            (void *) ctx->device->buffer_type.device);
+
+              ggml_backend_t vk_backend = new ggml_backend {
+                  /* .guid    = */ ggml_backend_vk_guid(),
+                  /* .iface   = */ ggml_backend_vk_interface,
+                  /* .device  = */ backend_device,
+                  /* .context = */ ctx,
+              };
+              GGML_LOG_INFO("[vulkan-legacy3] backend object allocated: backend=%p device=%p\n", (void *) vk_backend, (void *) vk_backend->device);
+
+              if (!ctx->device->support_async) {
+                  vk_backend->iface.get_tensor_async = nullptr;
+              }
+
+              GGML_LOG_INFO("[vulkan-legacy3] backend init complete\n");
+              return vk_backend;
+          }
+
+          ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
+              GGML_LOG_INFO("[vulkan-legacy3] public backend init resolving registry device: index=%zu\n", dev_num);
+              ggml_backend_dev_t backend_device = ggml_backend_reg_dev_get(ggml_backend_vk_reg(), dev_num);
+              GGML_LOG_INFO("[vulkan-legacy3] public backend init resolved device=%p\n", (void *) backend_device);
+              return ggml_backend_vk_init_with_device(dev_num, backend_device);
+          }
+          '@
+
+          if (-not $vulkanSource.Contains($oldBackendInit)) {
+            throw "Expected Vulkan backend initialization implementation was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldBackendInit, $legacyBackendInit)
+
+          $oldDeviceBufferType = @'
+          static ggml_backend_buffer_type_t ggml_backend_vk_device_get_buffer_type(ggml_backend_dev_t dev) {
+              ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
+              return ggml_backend_vk_buffer_type(ctx->device);
+          }
+          '@
+
+          $legacyDeviceBufferType = @'
+          static ggml_backend_buffer_type_t ggml_backend_vk_device_get_buffer_type(ggml_backend_dev_t dev) {
+              GGML_LOG_INFO("[vulkan-legacy3] buffer type lookup begin: dev=%p\n", (void *) dev);
+              ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *) dev->context;
+              GGML_LOG_INFO("[vulkan-legacy3] buffer type context: ctx=%p index=%zu\n", (void *) ctx, ctx->device);
+              ggml_backend_buffer_type_t buffer_type = ggml_backend_vk_buffer_type(ctx->device);
+              GGML_ASSERT(buffer_type);
+              buffer_type->device = dev;
+              GGML_LOG_INFO("[vulkan-legacy3] buffer type lookup complete and bound: buft=%p context=%p device=%p\n",
+                            (void *) buffer_type,
+                            (void *) buffer_type->context,
+                            (void *) buffer_type->device);
+              return buffer_type;
+          }
+          '@
+
+          if (-not $vulkanSource.Contains($oldDeviceBufferType)) {
+            throw "Expected Vulkan device buffer-type implementation was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldDeviceBufferType, $legacyDeviceBufferType)
+
+          $oldDeviceInit = @'
+          static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const char * params) {
+              UNUSED(params);
+              ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
+              return ggml_backend_vk_init(ctx->device);
+          }
+          '@
+
+          $legacyDeviceInit = @'
+          static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const char * params) {
+              UNUSED(params);
+              GGML_LOG_INFO("[vulkan-legacy3] registry device init begin: dev=%p\n", (void *) dev);
+              ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *) dev->context;
+              GGML_LOG_INFO("[vulkan-legacy3] registry device init context: ctx=%p index=%zu\n", (void *) ctx, ctx->device);
+
+              // The registry already supplied dev. Reuse it directly instead of
+              // calling the public initializer, which resolves the registry again.
+              ggml_backend_t backend = ggml_backend_vk_init_with_device(ctx->device, dev);
+              GGML_LOG_INFO("[vulkan-legacy3] registry device init complete: backend=%p\n", (void *) backend);
+              return backend;
+          }
+          '@
+
+          if (-not $vulkanSource.Contains($oldDeviceInit)) {
+            throw "Expected Vulkan registry device initializer was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldDeviceInit, $legacyDeviceInit)
+          Set-Content $vulkanPath $vulkanSource -Encoding UTF8
+
+          $initPath = "src\llama_cpp\__init__.py"
+          $init = Get-Content $initPath -Raw
+          $oldVersion = "__version__ = `"$env:SOURCE_VERSION`""
+          $newVersion = "__version__ = `"$env:PACKAGE_VERSION`""
+          if (-not $init.Contains($oldVersion)) {
+            throw "Expected package version $oldVersion was not found"
+          }
+          $init = $init.Replace($oldVersion, $newVersion)
+          Set-Content $initPath $init -Encoding UTF8
+
+          git -C src diff -- CMakeLists.txt llama_cpp/__init__.py vendor/llama.cpp/src/CMakeLists.txt vendor/llama.cpp/ggml/src/ggml-threading.cpp vendor/llama.cpp/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+
+      - name: Configure optimized Tiger Lake and Vulkan build
+        shell: pwsh
+        run: |
+          $flags = @(
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DBUILD_SHARED_LIBS=OFF",
+            "-DLLAVA_BUILD=OFF",
+            "-DGGML_NATIVE=OFF",
+            "-DGGML_OPENMP=ON",
+            "-DGGML_BACKEND_DL=OFF",
+            "-DGGML_CPU_ALL_VARIANTS=OFF",
+            "-DGGML_CPU_REPACK=ON",
+            "-DGGML_BLAS=OFF",
+            "-DGGML_CUDA=OFF",
+            "-DGGML_HIP=OFF",
+            "-DGGML_SYCL=OFF",
+            "-DGGML_OPENCL=OFF",
+            "-DGGML_RPC=OFF",
+            "-DGGML_METAL=OFF",
+            "-DGGML_VULKAN=ON",
+            "-DGGML_SSE42=ON",
+            "-DGGML_AVX=ON",
+            "-DGGML_AVX2=ON",
+            "-DGGML_FMA=ON",
+            "-DGGML_F16C=ON",
+            "-DGGML_BMI2=ON",
+            "-DGGML_AVX512=ON",
+            "-DGGML_AVX512_VBMI=ON",
+            "-DGGML_AVX512_VNNI=ON",
+            "-DGGML_AVX512_BF16=OFF",
+            "-DLLAMA_BUILD_TESTS=OFF",
+            "-DLLAMA_BUILD_EXAMPLES=OFF",
+            "-DLLAMA_BUILD_TOOLS=OFF",
+            "-DLLAMA_BUILD_SERVER=OFF"
+          )
+
+          $argsLine = $flags -join " "
+          "CMAKE_GENERATOR=Ninja" >> $env:GITHUB_ENV
+          "CMAKE_ARGS=$argsLine" >> $env:GITHUB_ENV
+          Write-Host "CMAKE_ARGS=$argsLine"
+
+      - name: Build wheel
+        shell: pwsh
+        run: |
+          Set-Location src
+          $outDir = Join-Path $env:GITHUB_WORKSPACE "wheelhouse"
+          New-Item -ItemType Directory -Force $outDir | Out-Null
+          python -m build --wheel --outdir $outDir
+
+      - name: Verify packaging and backend initialization
+        shell: pwsh
+        run: |
+          $wheel = Get-ChildItem "wheelhouse\*.whl" | Select-Object -First 1
+          if (-not $wheel) {
+            throw "No wheel was produced"
+          }
+
+          python -m venv testenv
+          $testPython = Join-Path $env:GITHUB_WORKSPACE "testenv\Scripts\python.exe"
+          & $testPython -m pip install --upgrade "pip<26"
+          & $testPython -m pip install --no-cache-dir $wheel.FullName
+
+          New-Item -ItemType Directory -Force reports | Out-Null
+
+          $testOutput = @'
+          import platform
+          import sys
+
+          import llama_cpp
+
+          print("Python:", sys.version)
+          print("Platform:", platform.platform())
+          print("llama-cpp-python:", llama_cpp.__version__)
+
+          print("Calling llama_backend_init()", flush=True)
+          llama_cpp.llama_backend_init()
+          print("BACKEND INIT OK", flush=True)
+          llama_cpp.llama_backend_free()
+          print("BACKEND FREE OK", flush=True)
+          '@ | & $testPython -I -X faulthandler -u 2>&1
+          $testExitCode = $LASTEXITCODE
+          $testOutput | Tee-Object "reports\legacy-vulkan-runtime-test.txt"
+          if ($testExitCode -ne 0) {
+            throw "Backend validation failed with exit code $testExitCode"
+          }
+
+          $llamaDll = Join-Path $env:GITHUB_WORKSPACE "testenv\Lib\site-packages\llama_cpp\lib\llama.dll"
+          dumpbin /DEPENDENTS $llamaDll |
+            Tee-Object "reports\legacy-vulkan-dll-dependencies.txt"
+
+      - name: Create reproducibility manifest
+        if: always()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force reports | Out-Null
+          $manifest = "reports\legacy-vulkan-build-manifest.txt"
+          "package_version=$env:PACKAGE_VERSION" | Set-Content $manifest
+          "source_version=$env:SOURCE_VERSION" | Add-Content $manifest
+          "source_commit=$(git -C src rev-parse HEAD)" | Add-Content $manifest
+          "python=$(python --version 2>&1)" | Add-Content $manifest
+          "cmake_args=$env:CMAKE_ARGS" | Add-Content $manifest
+          "core_srwlock_fix=enabled" | Add-Content $manifest
+          "vulkan_registry_pod_state=enabled" | Add-Content $manifest
+          "vulkan_registry_srwlock=enabled" | Add-Content $manifest
+          "vulkan_direct_registry_device_init=enabled" | Add-Content $manifest
+          "vulkan_preconstruction_registry_lookup=removed" | Add-Content $manifest
+          "vulkan_buffer_type_direct_binding=enabled" | Add-Content $manifest
+          "vulkan_buffer_type_checkpoints=enabled" | Add-Content $manifest
+          "submodules:" | Add-Content $manifest
+          git -C src submodule status | Add-Content $manifest
+
+          Get-ChildItem "wheelhouse\*.whl" -ErrorAction SilentlyContinue | ForEach-Object {
+            "wheel=$($_.Name)" | Add-Content $manifest
+            "wheel_size=$($_.Length)" | Add-Content $manifest
+            "wheel_sha256=$((Get-FileHash $_.FullName -Algorithm SHA256).Hash)" | Add-Content $manifest
+          }
+          Get-Content $manifest
+
+      - name: Upload wheel and reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: llama-cpp-python-${{ env.PACKAGE_VERSION }}-win-amd64
+          path: |
+            wheelhouse/*.whl
+            reports/*.txt
+          if-no-files-found: error
+          retention-days: 30
+
+  legacy-publish:
+    name: Publish legacy Vulkan prerelease
+    needs: legacy-build
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
     permissions:
       contents: write
+
+    steps:
+      - name: Download legacy Vulkan wheel and reports
+        uses: actions/download-artifact@v7
+        with:
+          name: llama-cpp-python-${{ env.PACKAGE_VERSION }}-win-amd64
+          path: release-assets
+
+      - name: Prepare release notes
+        shell: bash
+        run: |
+          cat > release-notes.md <<'EOF'
+          Experimental Windows x64 / Python 3.9 Vulkan compatibility wheel for llama-cpp-python 0.3.34 and legacy Intel Iris Xe driver stacks.
+
+          This build keeps the confirmed GGML and Vulkan-registry SRWLOCK fixes. It removes the recursive registry lookup from Vulkan buffer-type construction itself, initially leaves the buffer type unbound, and then binds it directly to the already-resolved registry device before use. Buffer-type and backend-construction checkpoints are enabled for the real Iris Xe test.
+
+          The GitHub Windows runner validated:
+          - wheel packaging and clean Python 3.9 installation
+          - llama_backend_init() and llama_backend_free()
+          - DLL dependencies
+          - reproducibility manifest and SHA-256
+
+          GitHub's runner has no Vulkan GPU. It can validate compilation, packaging, and backend initialization, but actual tensor placement and offload must be validated on the target Iris Xe workstation. This is a diagnostic compatibility prerelease, not a replacement for the stable optimized CPU wheel.
+          EOF
+
+      - name: Create or update public prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: v0.3.34-win39-vulkan-xelegacy-r3
+          RELEASE_TARGET: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          mapfile -d '' assets < <(find release-assets -type f -print0)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "No release assets were downloaded" >&2
+            exit 1
+          fi
+
+          if gh release view "$RELEASE_TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber --repo "$GH_REPO"
+            gh release edit "$RELEASE_TAG" \
+              --repo "$GH_REPO" \
+              --title "$RELEASE_TAG" \
+              --notes-file release-notes.md \
+              --prerelease
+          else
+            gh release create "$RELEASE_TAG" "${assets[@]}" \
+              --repo "$GH_REPO" \
+              --target "$RELEASE_TARGET" \
+              --title "$RELEASE_TAG" \
+              --notes-file release-notes.md \
+              --prerelease
+          fi
 
   build-release:
     if: github.event_name == 'workflow_dispatch'
