@@ -9,7 +9,7 @@ permissions:
 
 env:
   SOURCE_VERSION: "0.3.34"
-  PACKAGE_VERSION: "0.3.34+win.srw.vulkan.xelegacy8"
+  PACKAGE_VERSION: "0.3.34+win.srw.vulkan.xelegacy9"
   VULKAN_SDK_VERSION: "1.4.341.0"
 
 jobs:
@@ -929,17 +929,34 @@ jobs:
 
           $legacyVkPipelineCompletion = @'
               {
-                  GGML_LOG_INFO("[vulkan-legacy8] completion critical-section enter begin: name=%s\n",
+                  GGML_LOG_INFO("[vulkan-legacy9] completion critical-section enter begin: name=%s\n",
                                 pipeline->name.c_str());
                   std::lock_guard<ggml_vk_recursive_mutex> guard(device->compile_mutex);
-                  GGML_LOG_INFO("[vulkan-legacy8] completion critical-section acquired: name=%s\n",
+                  GGML_LOG_INFO("[vulkan-legacy9] completion critical-section acquired: name=%s\n",
                                 pipeline->name.c_str());
-                  device->all_pipelines.push_back(pipeline);
-                  pipeline->compiled = true;
+
+                  // all_pipelines is used only to enumerate Vulkan handles for
+                  // explicit destruction when the device is torn down. Its first
+                  // weak_ptr insertion faults on the target legacy Windows stack,
+                  // after Vulkan has successfully created the compute pipeline.
+                  // The normal device pipeline slot retains the strong owner, and
+                  // vkDestroyDevice reclaims the remaining driver objects.
+                  GGML_LOG_INFO("[vulkan-legacy9] cleanup registry bypassed: name=%s\n",
+                                pipeline->name.c_str());
+
+                  pipeline->compiled.store(true, std::memory_order_release);
+                  GGML_LOG_INFO("[vulkan-legacy9] compiled state stored: name=%s\n",
+                                pipeline->name.c_str());
                   pipeline->compile_pending = false;
+                  GGML_LOG_INFO("[vulkan-legacy9] pending state cleared: name=%s\n",
+                                pipeline->name.c_str());
               }
+              GGML_LOG_INFO("[vulkan-legacy9] completion critical-section released: name=%s\n",
+                            pipeline->name.c_str());
+              GGML_LOG_INFO("[vulkan-legacy9] waiter notification begin: name=%s\n",
+                            pipeline->name.c_str());
               device->compile_cv.notify_all();
-              GGML_LOG_INFO("[vulkan-legacy8] pipeline compilation complete: name=%s\n",
+              GGML_LOG_INFO("[vulkan-legacy9] pipeline compilation complete: name=%s\n",
                             pipeline->name.c_str());
           '@
 
@@ -1113,6 +1130,8 @@ jobs:
           "vulkan_runtime_fp16_rte_spirv_rewrite=disabled" | Add-Content $manifest
           "vulkan_multi_add=disabled" | Add-Content $manifest
           "vulkan_pipeline_stage_checkpoints=enabled" | Add-Content $manifest
+          "vulkan_pipeline_cleanup_registry=bypassed" | Add-Content $manifest
+          "vulkan_pipeline_completion_checkpoints=enabled" | Add-Content $manifest
           "submodules:" | Add-Content $manifest
           git -C src submodule status | Add-Content $manifest
 
@@ -1155,7 +1174,7 @@ jobs:
           cat > release-notes.md <<'EOF'
           Experimental Windows x64 / Python 3.9 Vulkan compatibility wheel for llama-cpp-python 0.3.34 and legacy Intel Iris Xe driver stacks.
 
-          This build keeps the confirmed GGML and Vulkan-registry SRWLOCK fixes, direct registry-device binding, CPU host-buffer fallback, minimal Intel Xe feature profile, queue-lock compatibility fix, and shader compile critical-section fix. It disables the optional runtime FP16 round-to-even SPIR-V rewrite and multi_add path for the legacy Intel driver. Detailed checkpoints identify the requested pipeline and separate shader-module creation, pipeline-layout creation, compute-pipeline creation, and completion locking during the real Iris Xe test.
+          This build keeps the confirmed GGML and Vulkan-registry SRWLOCK fixes, direct registry-device binding, CPU host-buffer fallback, minimal Intel Xe feature profile, queue-lock compatibility fix, shader compile critical-section fix, and the r8 shader compatibility switches. The r8 target log proved that the legacy Intel driver successfully creates the shader module, pipeline layout, and compute pipeline, then faults on the first insertion into Vulkan's weak-reference cleanup registry. R9 bypasses that optional cleanup registry while retaining the compiled pipeline through its normal device pipeline slot, and adds checkpoints around compiled-state publication, pending-state clearing, critical-section release, and waiter notification.
 
           The GitHub Windows runner validated:
           - wheel packaging and clean Python 3.9 installation
@@ -1171,7 +1190,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: v0.3.34-win39-vulkan-xelegacy-r8
+          RELEASE_TAG: v0.3.34-win39-vulkan-xelegacy-r9
           RELEASE_TARGET: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           mapfile -d '' assets < <(find release-assets -type f -print0)
