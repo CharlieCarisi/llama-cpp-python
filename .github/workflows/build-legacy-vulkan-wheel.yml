@@ -9,7 +9,7 @@ permissions:
 
 env:
   SOURCE_VERSION: "0.3.34"
-  PACKAGE_VERSION: "0.3.34+win.srw.vulkan.xelegacy7"
+  PACKAGE_VERSION: "0.3.34+win.srw.vulkan.xelegacy8"
   VULKAN_SDK_VERSION: "1.4.341.0"
 
 jobs:
@@ -792,6 +792,162 @@ jobs:
           }
           $vulkanSource = $vulkanSource.Replace($oldVkShaderCompileLock, $legacyVkShaderCompileLock)
 
+          # The old Intel driver reaches first-inference pipeline compilation
+          # but faults before a pipeline is usable. Avoid the optional runtime
+          # FP16 RTE SPIR-V mutation and the multi-add path that requires it.
+          $oldVkFp16Rte = '        device->float_controls_rte_fp16 = vk12_props.shaderRoundingModeRTEFloat16;'
+          $legacyVkFp16Rte = @'
+                  // The legacy Intel driver advertises FP16 RTE support but
+                  // faults while consuming the runtime-patched SPIR-V.
+                  device->float_controls_rte_fp16 = false;
+                  GGML_LOG_INFO("[vulkan-legacy8] runtime FP16 RTE SPIR-V rewrite disabled\n");
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkFp16Rte)) {
+            throw "Expected Vulkan FP16 RTE capability assignment was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkFp16Rte, $legacyVkFp16Rte)
+
+          $oldVkMultiAdd = @'
+                  device->multi_add = vk12_props.shaderRoundingModeRTEFloat16 &&
+                                      device->properties.limits.maxPushConstantsSize >= sizeof(vk_op_multi_add_push_constants) &&
+                                      getenv("GGML_VK_DISABLE_MULTI_ADD") == nullptr;
+          '@
+
+          $legacyVkMultiAdd = @'
+                  device->multi_add = false;
+                  GGML_LOG_INFO("[vulkan-legacy8] optional multi_add path disabled\n");
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkMultiAdd)) {
+            throw "Expected Vulkan multi_add capability assignment was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkMultiAdd, $legacyVkMultiAdd)
+
+          # Identify the exact requested shader and separate failures in SPIR-V
+          # module creation, pipeline layout, compute pipeline, and completion.
+          $oldVkPipelineClaim = @'
+                          has_claimed_task = true;
+          '@
+
+          $legacyVkPipelineClaim = @'
+                          has_claimed_task = true;
+                          GGML_LOG_INFO("[vulkan-legacy8] pipeline claimed: name=%s spv_size=%zu parameters=%u\n",
+                                        pipeline->name.c_str(), spv_size, parameter_count);
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkPipelineClaim)) {
+            throw "Expected Vulkan pipeline-claim site was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkPipelineClaim, $legacyVkPipelineClaim)
+
+          $oldVkPipelineEntry = @'
+              GGML_ASSERT(parameter_count > 0);
+              GGML_ASSERT(parameter_count <= MAX_PARAMETER_COUNT);
+              GGML_ASSERT(wg_denoms[0] > 0 && wg_denoms[1] > 0 && wg_denoms[2] > 0); // NOLINT
+          '@
+
+          $legacyVkPipelineEntry = @'
+              GGML_LOG_INFO("[vulkan-legacy8] pipeline compile entry: name=%s spv_size=%zu entrypoint=%s parameters=%u\n",
+                            pipeline->name.c_str(), spv_size, entrypoint.c_str(), parameter_count);
+              GGML_ASSERT(parameter_count > 0);
+              GGML_ASSERT(parameter_count <= MAX_PARAMETER_COUNT);
+              GGML_ASSERT(wg_denoms[0] > 0 && wg_denoms[1] > 0 && wg_denoms[2] > 0); // NOLINT
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkPipelineEntry)) {
+            throw "Expected Vulkan pipeline-entry assertions were not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkPipelineEntry, $legacyVkPipelineEntry)
+
+          $oldVkShaderModuleCreate = @'
+              pipeline->shader_module = device->device.createShaderModule(shader_module_create_info);
+          '@
+
+          $legacyVkShaderModuleCreate = @'
+              GGML_LOG_INFO("[vulkan-legacy8] shader-module creation begin: name=%s bytes=%zu\n",
+                            pipeline->name.c_str(), shader_module_create_info.codeSize);
+              pipeline->shader_module = device->device.createShaderModule(shader_module_create_info);
+              GGML_LOG_INFO("[vulkan-legacy8] shader-module creation complete: name=%s\n",
+                            pipeline->name.c_str());
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkShaderModuleCreate)) {
+            throw "Expected Vulkan shader-module creation site was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkShaderModuleCreate, $legacyVkShaderModuleCreate)
+
+          $oldVkPipelineLayoutCreate = @'
+              vk::PipelineLayoutCreateInfo pipeline_layout_create_info(vk::PipelineLayoutCreateFlags(), device->dsl, pcr);
+              pipeline->layout = device->device.createPipelineLayout(pipeline_layout_create_info);
+          '@
+
+          $legacyVkPipelineLayoutCreate = @'
+              vk::PipelineLayoutCreateInfo pipeline_layout_create_info(vk::PipelineLayoutCreateFlags(), device->dsl, pcr);
+              GGML_LOG_INFO("[vulkan-legacy8] pipeline-layout creation begin: name=%s\n",
+                            pipeline->name.c_str());
+              pipeline->layout = device->device.createPipelineLayout(pipeline_layout_create_info);
+              GGML_LOG_INFO("[vulkan-legacy8] pipeline-layout creation complete: name=%s\n",
+                            pipeline->name.c_str());
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkPipelineLayoutCreate)) {
+            throw "Expected Vulkan pipeline-layout creation site was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkPipelineLayoutCreate, $legacyVkPipelineLayoutCreate)
+
+          $oldVkComputePipelineCreate = @'
+              try {
+                  pipeline->pipeline = device->device.createComputePipeline(VK_NULL_HANDLE, compute_pipeline_create_info).value;
+              } catch (const vk::SystemError& e) {
+          '@
+
+          $legacyVkComputePipelineCreate = @'
+              try {
+                  GGML_LOG_INFO("[vulkan-legacy8] compute-pipeline creation begin: name=%s\n",
+                                pipeline->name.c_str());
+                  pipeline->pipeline = device->device.createComputePipeline(VK_NULL_HANDLE, compute_pipeline_create_info).value;
+                  GGML_LOG_INFO("[vulkan-legacy8] compute-pipeline creation complete: name=%s\n",
+                                pipeline->name.c_str());
+              } catch (const vk::SystemError& e) {
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkComputePipelineCreate)) {
+            throw "Expected Vulkan compute-pipeline creation site was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkComputePipelineCreate, $legacyVkComputePipelineCreate)
+
+          $oldVkPipelineCompletion = @'
+              {
+                  std::lock_guard<ggml_vk_recursive_mutex> guard(device->compile_mutex);
+                  device->all_pipelines.push_back(pipeline);
+                  pipeline->compiled = true;
+                  pipeline->compile_pending = false;
+              }
+              device->compile_cv.notify_all();
+          '@
+
+          $legacyVkPipelineCompletion = @'
+              {
+                  GGML_LOG_INFO("[vulkan-legacy8] completion critical-section enter begin: name=%s\n",
+                                pipeline->name.c_str());
+                  std::lock_guard<ggml_vk_recursive_mutex> guard(device->compile_mutex);
+                  GGML_LOG_INFO("[vulkan-legacy8] completion critical-section acquired: name=%s\n",
+                                pipeline->name.c_str());
+                  device->all_pipelines.push_back(pipeline);
+                  pipeline->compiled = true;
+                  pipeline->compile_pending = false;
+              }
+              device->compile_cv.notify_all();
+              GGML_LOG_INFO("[vulkan-legacy8] pipeline compilation complete: name=%s\n",
+                            pipeline->name.c_str());
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkPipelineCompletion)) {
+            throw "Expected Vulkan pipeline-completion block was not found after compile-lock replacement"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkPipelineCompletion, $legacyVkPipelineCompletion)
+
           $oldDeviceInit = @'
           static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const char * params) {
               UNUSED(params);
@@ -954,6 +1110,9 @@ jobs:
           "vulkan_compile_critical_section=enabled" | Add-Content $manifest
           "vulkan_compile_lock_sites_replaced=8" | Add-Content $manifest
           "vulkan_shader_loader_checkpoints=enabled" | Add-Content $manifest
+          "vulkan_runtime_fp16_rte_spirv_rewrite=disabled" | Add-Content $manifest
+          "vulkan_multi_add=disabled" | Add-Content $manifest
+          "vulkan_pipeline_stage_checkpoints=enabled" | Add-Content $manifest
           "submodules:" | Add-Content $manifest
           git -C src submodule status | Add-Content $manifest
 
@@ -996,7 +1155,7 @@ jobs:
           cat > release-notes.md <<'EOF'
           Experimental Windows x64 / Python 3.9 Vulkan compatibility wheel for llama-cpp-python 0.3.34 and legacy Intel Iris Xe driver stacks.
 
-          This build keeps the confirmed GGML and Vulkan-registry SRWLOCK fixes, direct registry-device binding, CPU host-buffer fallback, minimal Intel Xe feature profile, and queue-lock compatibility fix. It replaces Vulkan's remaining per-device shader compile std::mutex with the same Windows CRITICAL_SECTION wrapper across all eight compile-lock sites and uses std::condition_variable_any for compile waiters. Shader-loader and compile-lock checkpoints are enabled for the real Iris Xe test.
+          This build keeps the confirmed GGML and Vulkan-registry SRWLOCK fixes, direct registry-device binding, CPU host-buffer fallback, minimal Intel Xe feature profile, queue-lock compatibility fix, and shader compile critical-section fix. It disables the optional runtime FP16 round-to-even SPIR-V rewrite and multi_add path for the legacy Intel driver. Detailed checkpoints identify the requested pipeline and separate shader-module creation, pipeline-layout creation, compute-pipeline creation, and completion locking during the real Iris Xe test.
 
           The GitHub Windows runner validated:
           - wheel packaging and clean Python 3.9 installation
@@ -1012,7 +1171,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: v0.3.34-win39-vulkan-xelegacy-r7
+          RELEASE_TAG: v0.3.34-win39-vulkan-xelegacy-r8
           RELEASE_TARGET: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           mapfile -d '' assets < <(find release-assets -type f -print0)
