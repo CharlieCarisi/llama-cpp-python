@@ -1368,10 +1368,10 @@ jobs:
               GGML_ASSERT(ctx != nullptr);
               GGML_ASSERT(ctx->device != nullptr);
               GGML_ASSERT(pipeline != nullptr);
-              GGML_ASSERT(subctx.s != nullptr);
-              GGML_ASSERT(subctx.s->buffer != nullptr);
+              GGML_ASSERT(subctx->s != nullptr);
+              GGML_ASSERT(subctx->s->buffer != nullptr);
               GGML_ASSERT((VkDevice) ctx->device->device != VK_NULL_HANDLE);
-              GGML_ASSERT((VkCommandBuffer) subctx.s->buffer->buf != VK_NULL_HANDLE);
+              GGML_ASSERT((VkCommandBuffer) subctx->s->buffer->buf != VK_NULL_HANDLE);
               GGML_ASSERT((VkPipelineLayout) pipeline->layout != VK_NULL_HANDLE);
               GGML_ASSERT((VkPipeline) pipeline->pipeline != VK_NULL_HANDLE);
               GGML_LOG_INFO("[vulkan-legacy11] dispatch entry: ctx=%p device=%p pipeline=%p name=%s layout=%p pipeline_handle=%p command_buffer=%p descriptor_count=%zu descriptor_index=%zu descriptor_total=%zu elements=%u,%u,%u\n",
@@ -1381,7 +1381,7 @@ jobs:
                             pipeline->name.c_str(),
                             (void *) (VkPipelineLayout) pipeline->layout,
                             (void *) (VkPipeline) pipeline->pipeline,
-                            (void *) (VkCommandBuffer) subctx.s->buffer->buf,
+                            (void *) (VkCommandBuffer) subctx->s->buffer->buf,
                             descriptor_buffer_infos.size(),
                             ctx->descriptor_set_idx,
                             ctx->descriptor_sets.size(),
