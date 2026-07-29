@@ -9,7 +9,7 @@ permissions:
 
 env:
   SOURCE_VERSION: "0.3.34"
-  PACKAGE_VERSION: "0.3.34+win.srw.vulkan.xelegacy9"
+  PACKAGE_VERSION: "0.3.34+win.srw.vulkan.xelegacy10"
   VULKAN_SDK_VERSION: "1.4.341.0"
 
 jobs:
@@ -717,8 +717,9 @@ jobs:
           '@
 
           $legacyVkCompileMembers = @'
+              // Legacy Intel compatibility uses synchronous pipeline compilation
+              // plus atomic polling instead of the failing C++ condition variable.
               ggml_vk_recursive_mutex compile_mutex;
-              std::condition_variable_any compile_cv;
           '@
 
           if (-not $vulkanSource.Contains($oldVkCompileMembers)) {
@@ -749,12 +750,31 @@ jobs:
           }
           $vulkanSource = $vulkanSource.Replace($oldVkCompileLock, $legacyVkCompileLock)
 
-          $oldVkWaitLock = 'std::unique_lock<std::mutex> wait_lock(device->compile_mutex);'
-          $legacyVkWaitLock = 'std::unique_lock<ggml_vk_recursive_mutex> wait_lock(device->compile_mutex);'
-          if (-not $vulkanSource.Contains($oldVkWaitLock)) {
-            throw "Expected Vulkan shader wait lock was not found"
+          $oldVkWaitBlock = @'
+              if (wait_pipeline) {
+                  std::unique_lock<std::mutex> wait_lock(device->compile_mutex);
+                  device->compile_cv.wait(wait_lock, [&] {
+                      return wait_pipeline->compiled.load();
+                  });
+              }
+          '@
+
+          $legacyVkWaitBlock = @'
+              if (wait_pipeline) {
+                  GGML_LOG_INFO("[vulkan-legacy10] atomic pipeline wait begin: name=%s\n",
+                                wait_pipeline->name.c_str());
+                  while (!wait_pipeline->compiled.load(std::memory_order_acquire)) {
+                      Sleep(1);
+                  }
+                  GGML_LOG_INFO("[vulkan-legacy10] atomic pipeline wait complete: name=%s\n",
+                                wait_pipeline->name.c_str());
+              }
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkWaitBlock)) {
+            throw "Expected Vulkan condition-variable wait block was not found"
           }
-          $vulkanSource = $vulkanSource.Replace($oldVkWaitLock, $legacyVkWaitLock)
+          $vulkanSource = $vulkanSource.Replace($oldVkWaitBlock, $legacyVkWaitBlock)
 
           $oldVkShaderLoaderEntry = @'
           static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
@@ -929,34 +949,30 @@ jobs:
 
           $legacyVkPipelineCompletion = @'
               {
-                  GGML_LOG_INFO("[vulkan-legacy9] completion critical-section enter begin: name=%s\n",
+                  GGML_LOG_INFO("[vulkan-legacy10] completion critical-section enter begin: name=%s\n",
                                 pipeline->name.c_str());
                   std::lock_guard<ggml_vk_recursive_mutex> guard(device->compile_mutex);
-                  GGML_LOG_INFO("[vulkan-legacy9] completion critical-section acquired: name=%s\n",
+                  GGML_LOG_INFO("[vulkan-legacy10] completion critical-section acquired: name=%s\n",
                                 pipeline->name.c_str());
 
-                  // all_pipelines is used only to enumerate Vulkan handles for
-                  // explicit destruction when the device is torn down. Its first
-                  // weak_ptr insertion faults on the target legacy Windows stack,
-                  // after Vulkan has successfully created the compute pipeline.
-                  // The normal device pipeline slot retains the strong owner, and
+                  // The normal device pipeline slot retains the strong owner.
+                  // The optional weak-reference cleanup registry remains bypassed;
                   // vkDestroyDevice reclaims the remaining driver objects.
-                  GGML_LOG_INFO("[vulkan-legacy9] cleanup registry bypassed: name=%s\n",
+                  GGML_LOG_INFO("[vulkan-legacy10] cleanup registry bypassed: name=%s\n",
                                 pipeline->name.c_str());
 
-                  pipeline->compiled.store(true, std::memory_order_release);
-                  GGML_LOG_INFO("[vulkan-legacy9] compiled state stored: name=%s\n",
-                                pipeline->name.c_str());
                   pipeline->compile_pending = false;
-                  GGML_LOG_INFO("[vulkan-legacy9] pending state cleared: name=%s\n",
+                  GGML_LOG_INFO("[vulkan-legacy10] pending state cleared: name=%s\n",
+                                pipeline->name.c_str());
+                  pipeline->compiled.store(true, std::memory_order_release);
+                  GGML_LOG_INFO("[vulkan-legacy10] compiled state published: name=%s\n",
                                 pipeline->name.c_str());
               }
-              GGML_LOG_INFO("[vulkan-legacy9] completion critical-section released: name=%s\n",
+              GGML_LOG_INFO("[vulkan-legacy10] completion critical-section released: name=%s\n",
                             pipeline->name.c_str());
-              GGML_LOG_INFO("[vulkan-legacy9] waiter notification begin: name=%s\n",
+              GGML_LOG_INFO("[vulkan-legacy10] condition-variable notification bypassed: name=%s\n",
                             pipeline->name.c_str());
-              device->compile_cv.notify_all();
-              GGML_LOG_INFO("[vulkan-legacy9] pipeline compilation complete: name=%s\n",
+              GGML_LOG_INFO("[vulkan-legacy10] pipeline compilation complete: name=%s\n",
                             pipeline->name.c_str());
           '@
 
@@ -1131,6 +1147,8 @@ jobs:
           "vulkan_multi_add=disabled" | Add-Content $manifest
           "vulkan_pipeline_stage_checkpoints=enabled" | Add-Content $manifest
           "vulkan_pipeline_cleanup_registry=bypassed" | Add-Content $manifest
+          "vulkan_compile_condition_variable=disabled" | Add-Content $manifest
+          "vulkan_compile_wait_strategy=atomic_polling" | Add-Content $manifest
           "vulkan_pipeline_completion_checkpoints=enabled" | Add-Content $manifest
           "submodules:" | Add-Content $manifest
           git -C src submodule status | Add-Content $manifest
@@ -1174,7 +1192,7 @@ jobs:
           cat > release-notes.md <<'EOF'
           Experimental Windows x64 / Python 3.9 Vulkan compatibility wheel for llama-cpp-python 0.3.34 and legacy Intel Iris Xe driver stacks.
 
-          This build keeps the confirmed GGML and Vulkan-registry SRWLOCK fixes, direct registry-device binding, CPU host-buffer fallback, minimal Intel Xe feature profile, queue-lock compatibility fix, shader compile critical-section fix, and the r8 shader compatibility switches. The r8 target log proved that the legacy Intel driver successfully creates the shader module, pipeline layout, and compute pipeline, then faults on the first insertion into Vulkan's weak-reference cleanup registry. R9 bypasses that optional cleanup registry while retaining the compiled pipeline through its normal device pipeline slot, and adds checkpoints around compiled-state publication, pending-state clearing, critical-section release, and waiter notification.
+          This build keeps the confirmed GGML and Vulkan-registry SRWLOCK fixes, direct registry-device binding, CPU host-buffer fallback, minimal Intel Xe feature profile, queue-lock compatibility fix, shader compile critical-section fix, r8 shader compatibility switches, and r9 cleanup-registry bypass. The r9 target log proved that compute-pipeline creation and compiled-state publication succeed, then the target faults exactly at condition_variable_any::notify_all(). R10 removes the compile condition variable, publishes completion through the existing atomic flag, and uses a Windows-compatible atomic polling wait for concurrent pipeline requests.
 
           The GitHub Windows runner validated:
           - wheel packaging and clean Python 3.9 installation
@@ -1190,7 +1208,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: v0.3.34-win39-vulkan-xelegacy-r9
+          RELEASE_TAG: v0.3.34-win39-vulkan-xelegacy-r10
           RELEASE_TARGET: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           mapfile -d '' assets < <(find release-assets -type f -print0)
