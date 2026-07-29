@@ -9,7 +9,7 @@ permissions:
 
 env:
   SOURCE_VERSION: "0.3.34"
-  PACKAGE_VERSION: "0.3.34+win.srw.vulkan.xelegacy5"
+  PACKAGE_VERSION: "0.3.34+win.srw.vulkan.xelegacy6"
   VULKAN_SDK_VERSION: "1.4.341.0"
 
 jobs:
@@ -608,6 +608,107 @@ jobs:
           }
           $vulkanSource = $vulkanSource.Replace($oldHostBufferCapability, $newHostBufferCapability)
 
+          # Replace the per-device std::recursive_mutex used by Vulkan queue
+          # and transfer operations. CRITICAL_SECTION preserves same-thread
+          # recursion without relying on the failing MSVC mutex implementation.
+          $oldVkRecursiveMutex = @'
+          struct vk_device_struct {
+              std::recursive_mutex mutex;
+              mutable std::shared_mutex pinned_memory_mutex;
+          '@
+
+          $legacyVkRecursiveMutex = @'
+          #if defined(_WIN32)
+          struct ggml_vk_recursive_mutex {
+              CRITICAL_SECTION section;
+
+              ggml_vk_recursive_mutex() {
+                  InitializeCriticalSection(&section);
+              }
+
+              ~ggml_vk_recursive_mutex() {
+                  DeleteCriticalSection(&section);
+              }
+
+              ggml_vk_recursive_mutex(const ggml_vk_recursive_mutex &) = delete;
+              ggml_vk_recursive_mutex & operator=(const ggml_vk_recursive_mutex &) = delete;
+
+              void lock() {
+                  EnterCriticalSection(&section);
+              }
+
+              void unlock() {
+                  LeaveCriticalSection(&section);
+              }
+          };
+          #else
+          using ggml_vk_recursive_mutex = std::recursive_mutex;
+          #endif
+
+          struct vk_device_struct {
+              ggml_vk_recursive_mutex mutex;
+              mutable std::shared_mutex pinned_memory_mutex;
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkRecursiveMutex)) {
+            throw "Expected Vulkan per-device recursive mutex declaration was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkRecursiveMutex, $legacyVkRecursiveMutex)
+
+          $oldVkRecursiveGuard = 'std::lock_guard<std::recursive_mutex>'
+          $legacyVkRecursiveGuard = 'std::lock_guard<ggml_vk_recursive_mutex>'
+          $recursiveGuardMatches = ([regex]::Matches($vulkanSource, [regex]::Escape($oldVkRecursiveGuard))).Count
+          if ($recursiveGuardMatches -ne 6) {
+            throw "Expected six Vulkan recursive-mutex guards, found $recursiveGuardMatches"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkRecursiveGuard, $legacyVkRecursiveGuard)
+
+          $oldVkCreateQueueHelper = @'
+          static void ggml_vk_create_queue(vk_device& device, vk_queue& q, uint32_t queue_family_index, uint32_t queue_index, vk::PipelineStageFlags&& stage_flags, bool transfer_only) {
+              VK_LOG_DEBUG("ggml_vk_create_queue()");
+              std::lock_guard<ggml_vk_recursive_mutex> guard(device->mutex);
+
+              q.queue_family_index = queue_family_index;
+              q.transfer_only = transfer_only;
+
+              q.cmd_pool.init(device, &q);
+
+              q.queue = device->device.getQueue(queue_family_index, queue_index);
+
+              q.stage_flags = stage_flags;
+          }
+          '@
+
+          $legacyVkCreateQueueHelper = @'
+          static void ggml_vk_create_queue(vk_device& device, vk_queue& q, uint32_t queue_family_index, uint32_t queue_index, vk::PipelineStageFlags&& stage_flags, bool transfer_only) {
+              VK_LOG_DEBUG("ggml_vk_create_queue()");
+              GGML_LOG_INFO("[vulkan-legacy6] queue helper entry: device=%p family=%u index=%u transfer_only=%d\n",
+                            (void *) device.get(), queue_family_index, queue_index, transfer_only ? 1 : 0);
+              GGML_LOG_INFO("[vulkan-legacy6] queue critical-section enter begin\n");
+              std::lock_guard<ggml_vk_recursive_mutex> guard(device->mutex);
+              GGML_LOG_INFO("[vulkan-legacy6] queue critical-section acquired\n");
+
+              q.queue_family_index = queue_family_index;
+              q.transfer_only = transfer_only;
+
+              GGML_LOG_INFO("[vulkan-legacy6] command-pool init begin\n");
+              q.cmd_pool.init(device, &q);
+              GGML_LOG_INFO("[vulkan-legacy6] command-pool init complete\n");
+
+              GGML_LOG_INFO("[vulkan-legacy6] queue retrieval begin\n");
+              q.queue = device->device.getQueue(queue_family_index, queue_index);
+              GGML_LOG_INFO("[vulkan-legacy6] queue retrieval complete\n");
+
+              q.stage_flags = stage_flags;
+              GGML_LOG_INFO("[vulkan-legacy6] queue helper complete\n");
+          }
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkCreateQueueHelper)) {
+            throw "Expected Vulkan queue-creation helper was not found after recursive-lock replacement"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkCreateQueueHelper, $legacyVkCreateQueueHelper)
+
           $oldDeviceInit = @'
           static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const char * params) {
               UNUSED(params);
@@ -764,6 +865,9 @@ jobs:
           "vulkan_device_init_checkpoints=enabled" | Add-Content $manifest
           "vulkan_cpu_host_buffer_fallback=enabled" | Add-Content $manifest
           "vulkan_registry_return_checkpoints=enabled" | Add-Content $manifest
+          "vulkan_per_device_critical_section=enabled" | Add-Content $manifest
+          "vulkan_recursive_lock_sites_replaced=6" | Add-Content $manifest
+          "vulkan_queue_creation_checkpoints=enabled" | Add-Content $manifest
           "submodules:" | Add-Content $manifest
           git -C src submodule status | Add-Content $manifest
 
@@ -806,7 +910,7 @@ jobs:
           cat > release-notes.md <<'EOF'
           Experimental Windows x64 / Python 3.9 Vulkan compatibility wheel for llama-cpp-python 0.3.34 and legacy Intel Iris Xe driver stacks.
 
-          This build keeps the confirmed GGML and Vulkan-registry SRWLOCK fixes, direct registry-device binding, and CPU host-buffer fallback from xelegacy4. It also applies a minimal Intel Xe feature profile for the 2022 Windows driver: required 16-bit storage and FP16 remain enabled, while optional cooperative-matrix, integer-dot, external-host-memory, subgroup-control, pipeline-introspection, and async paths are disabled. Full device-creation checkpoints are enabled for the real Iris Xe test.
+          This build keeps the confirmed GGML and Vulkan-registry SRWLOCK fixes, direct registry-device binding, CPU host-buffer fallback, and the preceding minimal Intel Xe feature profile. It replaces Vulkan's per-device std::recursive_mutex with a Windows CRITICAL_SECTION wrapper across all six recursive lock sites, preserving same-thread recursion. Queue-lock, command-pool, and queue-retrieval checkpoints are enabled for the real Iris Xe test.
 
           The GitHub Windows runner validated:
           - wheel packaging and clean Python 3.9 installation
@@ -822,7 +926,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: v0.3.34-win39-vulkan-xelegacy-r5
+          RELEASE_TAG: v0.3.34-win39-vulkan-xelegacy-r6
           RELEASE_TARGET: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           mapfile -d '' assets < <(find release-assets -type f -print0)
