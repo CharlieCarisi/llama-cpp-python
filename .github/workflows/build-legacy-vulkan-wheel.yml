@@ -9,7 +9,7 @@ permissions:
 
 env:
   SOURCE_VERSION: "0.3.34"
-  PACKAGE_VERSION: "0.3.34+win.srw.vulkan.xelegacy6"
+  PACKAGE_VERSION: "0.3.34+win.srw.vulkan.xelegacy7"
   VULKAN_SDK_VERSION: "1.4.341.0"
 
 jobs:
@@ -709,6 +709,89 @@ jobs:
           }
           $vulkanSource = $vulkanSource.Replace($oldVkCreateQueueHelper, $legacyVkCreateQueueHelper)
 
+          # The shader loader uses a separate per-device std::mutex. Replace it
+          # with the compatibility critical section and update all lock sites.
+          $oldVkCompileMembers = @'
+              std::mutex compile_mutex;
+              std::condition_variable compile_cv;
+          '@
+
+          $legacyVkCompileMembers = @'
+              ggml_vk_recursive_mutex compile_mutex;
+              std::condition_variable_any compile_cv;
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkCompileMembers)) {
+            throw "Expected Vulkan compile synchronization members were not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkCompileMembers, $legacyVkCompileMembers)
+
+          $oldVkDeviceCompileGuard = 'std::lock_guard<std::mutex> guard(device->compile_mutex);'
+          $legacyVkDeviceCompileGuard = 'std::lock_guard<ggml_vk_recursive_mutex> guard(device->compile_mutex);'
+          $deviceCompileGuardMatches = ([regex]::Matches($vulkanSource, [regex]::Escape($oldVkDeviceCompileGuard))).Count
+          if ($deviceCompileGuardMatches -ne 1) {
+            throw "Expected one direct Vulkan compile guard, found $deviceCompileGuardMatches"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkDeviceCompileGuard, $legacyVkDeviceCompileGuard)
+
+          $oldVkContextCompileGuard = 'std::lock_guard<std::mutex> guard(ctx->device->compile_mutex);'
+          $legacyVkContextCompileGuard = 'std::lock_guard<ggml_vk_recursive_mutex> guard(ctx->device->compile_mutex);'
+          $contextCompileGuardMatches = ([regex]::Matches($vulkanSource, [regex]::Escape($oldVkContextCompileGuard))).Count
+          if ($contextCompileGuardMatches -ne 5) {
+            throw "Expected five context Vulkan compile guards, found $contextCompileGuardMatches"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkContextCompileGuard, $legacyVkContextCompileGuard)
+
+          $oldVkCompileLock = 'std::unique_lock<std::mutex> compile_lock(device->compile_mutex);'
+          $legacyVkCompileLock = 'std::unique_lock<ggml_vk_recursive_mutex> compile_lock(device->compile_mutex);'
+          if (-not $vulkanSource.Contains($oldVkCompileLock)) {
+            throw "Expected Vulkan shader compile lock was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkCompileLock, $legacyVkCompileLock)
+
+          $oldVkWaitLock = 'std::unique_lock<std::mutex> wait_lock(device->compile_mutex);'
+          $legacyVkWaitLock = 'std::unique_lock<ggml_vk_recursive_mutex> wait_lock(device->compile_mutex);'
+          if (-not $vulkanSource.Contains($oldVkWaitLock)) {
+            throw "Expected Vulkan shader wait lock was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkWaitLock, $legacyVkWaitLock)
+
+          $oldVkShaderLoaderEntry = @'
+          static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+              VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
+          '@
+
+          $legacyVkShaderLoaderEntry = @'
+          static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+              GGML_LOG_INFO("[vulkan-legacy7] shader loader entry: device=%p requested=%p\n",
+                            (void *) device.get(), (void *) requested.get());
+              VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkShaderLoaderEntry)) {
+            throw "Expected Vulkan shader-loader entry was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkShaderLoaderEntry, $legacyVkShaderLoaderEntry)
+
+          $oldVkShaderCompileLock = @'
+              std::unique_lock<ggml_vk_recursive_mutex> compile_lock(device->compile_mutex);
+
+              if (device->coopmat2) {
+          '@
+
+          $legacyVkShaderCompileLock = @'
+              GGML_LOG_INFO("[vulkan-legacy7] compile critical-section enter begin\n");
+              std::unique_lock<ggml_vk_recursive_mutex> compile_lock(device->compile_mutex);
+              GGML_LOG_INFO("[vulkan-legacy7] compile critical-section acquired\n");
+
+              if (device->coopmat2) {
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkShaderCompileLock)) {
+            throw "Expected Vulkan shader compile-lock site was not found after type replacement"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkShaderCompileLock, $legacyVkShaderCompileLock)
+
           $oldDeviceInit = @'
           static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const char * params) {
               UNUSED(params);
@@ -868,6 +951,9 @@ jobs:
           "vulkan_per_device_critical_section=enabled" | Add-Content $manifest
           "vulkan_recursive_lock_sites_replaced=6" | Add-Content $manifest
           "vulkan_queue_creation_checkpoints=enabled" | Add-Content $manifest
+          "vulkan_compile_critical_section=enabled" | Add-Content $manifest
+          "vulkan_compile_lock_sites_replaced=8" | Add-Content $manifest
+          "vulkan_shader_loader_checkpoints=enabled" | Add-Content $manifest
           "submodules:" | Add-Content $manifest
           git -C src submodule status | Add-Content $manifest
 
@@ -910,7 +996,7 @@ jobs:
           cat > release-notes.md <<'EOF'
           Experimental Windows x64 / Python 3.9 Vulkan compatibility wheel for llama-cpp-python 0.3.34 and legacy Intel Iris Xe driver stacks.
 
-          This build keeps the confirmed GGML and Vulkan-registry SRWLOCK fixes, direct registry-device binding, CPU host-buffer fallback, and the preceding minimal Intel Xe feature profile. It replaces Vulkan's per-device std::recursive_mutex with a Windows CRITICAL_SECTION wrapper across all six recursive lock sites, preserving same-thread recursion. Queue-lock, command-pool, and queue-retrieval checkpoints are enabled for the real Iris Xe test.
+          This build keeps the confirmed GGML and Vulkan-registry SRWLOCK fixes, direct registry-device binding, CPU host-buffer fallback, minimal Intel Xe feature profile, and queue-lock compatibility fix. It replaces Vulkan's remaining per-device shader compile std::mutex with the same Windows CRITICAL_SECTION wrapper across all eight compile-lock sites and uses std::condition_variable_any for compile waiters. Shader-loader and compile-lock checkpoints are enabled for the real Iris Xe test.
 
           The GitHub Windows runner validated:
           - wheel packaging and clean Python 3.9 installation
@@ -926,7 +1012,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: v0.3.34-win39-vulkan-xelegacy-r6
+          RELEASE_TAG: v0.3.34-win39-vulkan-xelegacy-r7
           RELEASE_TARGET: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           mapfile -d '' assets < <(find release-assets -type f -print0)
