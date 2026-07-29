@@ -9,7 +9,7 @@ permissions:
 
 env:
   SOURCE_VERSION: "0.3.34"
-  PACKAGE_VERSION: "0.3.34+win.srw.vulkan.xelegacy10"
+  PACKAGE_VERSION: "0.3.34+win.srw.vulkan.xelegacy11"
   VULKAN_SDK_VERSION: "1.4.341.0"
 
 jobs:
@@ -981,6 +981,510 @@ jobs:
           }
           $vulkanSource = $vulkanSource.Replace($oldVkPipelineCompletion, $legacyVkPipelineCompletion)
 
+          # R10 proves pipeline compilation and synchronization complete. Trace
+          # the first descriptor, tensor-buffer, and command-recording paths
+          # reached immediately afterward without changing backend behavior.
+          $oldVkDescriptorRequest = @'
+          static void ggml_pipeline_request_descriptor_sets(ggml_backend_vk_context *ctx, vk_pipeline& pipeline, uint32_t n) {
+              VK_LOG_DEBUG("ggml_pipeline_request_descriptor_sets(" << pipeline->name << ", " << n << ")");
+              ctx->pipeline_descriptor_set_requirements += n;
+              if (!pipeline->compiled) {
+                  ggml_vk_load_shaders(ctx->device, pipeline);
+              }
+              ggml_pipeline_allocate_descriptor_sets(ctx);
+          }
+          '@
+
+          $legacyVkDescriptorRequest = @'
+          static void ggml_pipeline_request_descriptor_sets(ggml_backend_vk_context *ctx, vk_pipeline& pipeline, uint32_t n) {
+              GGML_ASSERT(ctx != nullptr);
+              GGML_ASSERT(ctx->device != nullptr);
+              GGML_ASSERT(pipeline != nullptr);
+              GGML_LOG_INFO("[vulkan-legacy11] descriptor request entry: ctx=%p device=%p pipeline=%p name=%s count=%u compiled=%d existing=%zu required_before=%u\n",
+                            (void *) ctx,
+                            (void *) ctx->device.get(),
+                            (void *) pipeline.get(),
+                            pipeline->name.c_str(),
+                            n,
+                            pipeline->compiled.load() ? 1 : 0,
+                            ctx->descriptor_sets.size(),
+                            ctx->pipeline_descriptor_set_requirements);
+              VK_LOG_DEBUG("ggml_pipeline_request_descriptor_sets(" << pipeline->name << ", " << n << ")");
+              ctx->pipeline_descriptor_set_requirements += n;
+              GGML_LOG_INFO("[vulkan-legacy11] descriptor requirement updated: name=%s required_after=%u\n",
+                            pipeline->name.c_str(),
+                            ctx->pipeline_descriptor_set_requirements);
+              if (!pipeline->compiled) {
+                  GGML_LOG_INFO("[vulkan-legacy11] descriptor request shader load begin: name=%s\n",
+                                pipeline->name.c_str());
+                  ggml_vk_load_shaders(ctx->device, pipeline);
+                  GGML_LOG_INFO("[vulkan-legacy11] descriptor request shader load complete: name=%s compiled=%d\n",
+                                pipeline->name.c_str(),
+                                pipeline->compiled.load() ? 1 : 0);
+              }
+              GGML_LOG_INFO("[vulkan-legacy11] descriptor allocation call begin: name=%s\n",
+                            pipeline->name.c_str());
+              ggml_pipeline_allocate_descriptor_sets(ctx);
+              GGML_LOG_INFO("[vulkan-legacy11] descriptor allocation call complete: name=%s existing=%zu required=%u\n",
+                            pipeline->name.c_str(),
+                            ctx->descriptor_sets.size(),
+                            ctx->pipeline_descriptor_set_requirements);
+          }
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkDescriptorRequest)) {
+            throw "Expected Vulkan descriptor-request function was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkDescriptorRequest, $legacyVkDescriptorRequest)
+
+          $oldVkDescriptorAllocateEntry = @'
+          static void ggml_pipeline_allocate_descriptor_sets(ggml_backend_vk_context * ctx) {
+
+              if (ctx->descriptor_sets.size() >= ctx->pipeline_descriptor_set_requirements) {
+                  // Enough descriptors are available
+                  return;
+              }
+
+              vk_device& device = ctx->device;
+          '@
+
+          $legacyVkDescriptorAllocateEntry = @'
+          static void ggml_pipeline_allocate_descriptor_sets(ggml_backend_vk_context * ctx) {
+              GGML_ASSERT(ctx != nullptr);
+              GGML_ASSERT(ctx->device != nullptr);
+              GGML_LOG_INFO("[vulkan-legacy11] descriptor allocator entry: ctx=%p device=%p existing=%zu required=%u pools=%zu dsl=%p\n",
+                            (void *) ctx,
+                            (void *) ctx->device.get(),
+                            ctx->descriptor_sets.size(),
+                            ctx->pipeline_descriptor_set_requirements,
+                            ctx->descriptor_pools.size(),
+                            (void *) (VkDescriptorSetLayout) ctx->device->dsl);
+
+              GGML_ASSERT((VkDevice) ctx->device->device != VK_NULL_HANDLE);
+              GGML_ASSERT((VkDescriptorSetLayout) ctx->device->dsl != VK_NULL_HANDLE);
+              if (ctx->descriptor_sets.size() >= ctx->pipeline_descriptor_set_requirements) {
+                  GGML_LOG_INFO("[vulkan-legacy11] descriptor allocator reused existing sets: existing=%zu required=%u\n",
+                                ctx->descriptor_sets.size(),
+                                ctx->pipeline_descriptor_set_requirements);
+                  return;
+              }
+
+              vk_device& device = ctx->device;
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkDescriptorAllocateEntry)) {
+            throw "Expected Vulkan descriptor allocator entry was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkDescriptorAllocateEntry, $legacyVkDescriptorAllocateEntry)
+
+          $oldVkDescriptorPoolCreate = @'
+                  if (pool_idx >= ctx->descriptor_pools.size()) {
+                      vk::DescriptorPoolSize descriptor_pool_size(vk::DescriptorType::eStorageBuffer, MAX_PARAMETER_COUNT * VK_DEVICE_DESCRIPTOR_POOL_SIZE);
+                      vk::DescriptorPoolCreateInfo descriptor_pool_create_info({}, VK_DEVICE_DESCRIPTOR_POOL_SIZE, descriptor_pool_size);
+                      ctx->descriptor_pools.push_back(device->device.createDescriptorPool(descriptor_pool_create_info));
+                  }
+          '@
+
+          $legacyVkDescriptorPoolCreate = @'
+                  if (pool_idx >= ctx->descriptor_pools.size()) {
+                      vk::DescriptorPoolSize descriptor_pool_size(vk::DescriptorType::eStorageBuffer, MAX_PARAMETER_COUNT * VK_DEVICE_DESCRIPTOR_POOL_SIZE);
+                      vk::DescriptorPoolCreateInfo descriptor_pool_create_info({}, VK_DEVICE_DESCRIPTOR_POOL_SIZE, descriptor_pool_size);
+                      GGML_LOG_INFO("[vulkan-legacy11] descriptor pool creation begin: pool_index=%u max_sets=%u descriptors=%u\n",
+                                    pool_idx,
+                                    VK_DEVICE_DESCRIPTOR_POOL_SIZE,
+                                    MAX_PARAMETER_COUNT * VK_DEVICE_DESCRIPTOR_POOL_SIZE);
+                      ctx->descriptor_pools.push_back(device->device.createDescriptorPool(descriptor_pool_create_info));
+                      GGML_ASSERT((VkDescriptorPool) ctx->descriptor_pools.back() != VK_NULL_HANDLE);
+                      GGML_LOG_INFO("[vulkan-legacy11] descriptor pool creation complete: pool_index=%u pool=%p total_pools=%zu\n",
+                                    pool_idx,
+                                    (void *) (VkDescriptorPool) ctx->descriptor_pools.back(),
+                                    ctx->descriptor_pools.size());
+                  }
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkDescriptorPoolCreate)) {
+            throw "Expected Vulkan descriptor-pool creation block was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkDescriptorPoolCreate, $legacyVkDescriptorPoolCreate)
+
+          $oldVkDescriptorSetAllocate = @'
+                  std::vector<vk::DescriptorSetLayout> layouts(alloc_count);
+                  for (uint32_t i = 0; i < alloc_count; i++) {
+                      layouts[i] = device->dsl;
+                  }
+                  vk::DescriptorSetAllocateInfo descriptor_set_alloc_info(ctx->descriptor_pools[pool_idx], alloc_count, layouts.data());
+                  std::vector<vk::DescriptorSet> sets = device->device.allocateDescriptorSets(descriptor_set_alloc_info);
+                  ctx->descriptor_sets.insert(ctx->descriptor_sets.end(), sets.begin(), sets.end());
+
+                  pool_idx++;
+          '@
+
+          $legacyVkDescriptorSetAllocate = @'
+                  GGML_ASSERT(pool_idx < ctx->descriptor_pools.size());
+                  GGML_ASSERT((VkDescriptorPool) ctx->descriptor_pools[pool_idx] != VK_NULL_HANDLE);
+                  std::vector<vk::DescriptorSetLayout> layouts(alloc_count);
+                  for (uint32_t i = 0; i < alloc_count; i++) {
+                      layouts[i] = device->dsl;
+                  }
+                  vk::DescriptorSetAllocateInfo descriptor_set_alloc_info(ctx->descriptor_pools[pool_idx], alloc_count, layouts.data());
+                  GGML_LOG_INFO("[vulkan-legacy11] descriptor set allocation begin: pool_index=%u pool=%p layout=%p count=%u\n",
+                                pool_idx,
+                                (void *) (VkDescriptorPool) ctx->descriptor_pools[pool_idx],
+                                (void *) (VkDescriptorSetLayout) device->dsl,
+                                alloc_count);
+                  std::vector<vk::DescriptorSet> sets = device->device.allocateDescriptorSets(descriptor_set_alloc_info);
+                  GGML_LOG_INFO("[vulkan-legacy11] descriptor set allocation returned: pool_index=%u count=%zu\n",
+                                pool_idx,
+                                sets.size());
+                  GGML_ASSERT(sets.size() == alloc_count);
+                  for (size_t i = 0; i < sets.size(); ++i) {
+                      GGML_ASSERT((VkDescriptorSet) sets[i] != VK_NULL_HANDLE);
+                      GGML_LOG_INFO("[vulkan-legacy11] descriptor set validated: pool_index=%u set_index=%zu set=%p\n",
+                                    pool_idx,
+                                    i,
+                                    (void *) (VkDescriptorSet) sets[i]);
+                  }
+                  ctx->descriptor_sets.insert(ctx->descriptor_sets.end(), sets.begin(), sets.end());
+                  GGML_LOG_INFO("[vulkan-legacy11] descriptor set insertion complete: total_sets=%zu required=%u\n",
+                                ctx->descriptor_sets.size(),
+                                ctx->pipeline_descriptor_set_requirements);
+
+                  pool_idx++;
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkDescriptorSetAllocate)) {
+            throw "Expected Vulkan descriptor-set allocation block was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkDescriptorSetAllocate, $legacyVkDescriptorSetAllocate)
+
+          $oldVkTensorSubbuffer = @'
+          static vk_subbuffer ggml_vk_tensor_subbuffer(
+              const ggml_backend_vk_context * ctx, const ggml_tensor * tensor, bool allow_misalign = false) {
+
+              vk_buffer buffer = nullptr;
+              size_t offset = 0;
+              if (ctx->device->uma) {
+                  ggml_vk_host_get(ctx->device, tensor->data, buffer, offset);
+              }
+              if (!buffer) {
+                  auto buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
+                  buffer = buf_ctx->dev_buffer;
+                  offset = vk_tensor_offset(tensor) + tensor->view_offs;
+              }
+              GGML_ASSERT(buffer != nullptr);
+
+              size_t size = ggml_nbytes(tensor);
+
+              size_t misalign_bytes = offset & (ctx->device->properties.limits.minStorageBufferOffsetAlignment - 1);
+              // The shader must support misaligned offsets when indexing into the buffer
+              GGML_ASSERT(allow_misalign || misalign_bytes == 0);
+              offset &= ~misalign_bytes;
+              size += misalign_bytes;
+
+              return vk_subbuffer{buffer, offset, size};
+          }
+          '@
+
+          $legacyVkTensorSubbuffer = @'
+          static vk_subbuffer ggml_vk_tensor_subbuffer(
+              const ggml_backend_vk_context * ctx, const ggml_tensor * tensor, bool allow_misalign = false) {
+              GGML_ASSERT(ctx != nullptr);
+              GGML_ASSERT(ctx->device != nullptr);
+              GGML_ASSERT(tensor != nullptr);
+              GGML_LOG_INFO("[vulkan-legacy11] tensor subbuffer entry: ctx=%p tensor=%p name=%s type=%d data=%p tensor_buffer=%p allow_misalign=%d uma=%d\n",
+                            (void *) ctx,
+                            (void *) tensor,
+                            tensor->name,
+                            (int) tensor->type,
+                            tensor->data,
+                            (void *) tensor->buffer,
+                            allow_misalign ? 1 : 0,
+                            ctx->device->uma ? 1 : 0);
+
+              vk_buffer buffer = nullptr;
+              size_t offset = 0;
+              if (ctx->device->uma) {
+                  GGML_LOG_INFO("[vulkan-legacy11] tensor UMA lookup begin: name=%s\n", tensor->name);
+                  ggml_vk_host_get(ctx->device, tensor->data, buffer, offset);
+                  GGML_LOG_INFO("[vulkan-legacy11] tensor UMA lookup complete: name=%s buffer=%p offset=%zu\n",
+                                tensor->name,
+                                (void *) buffer.get(),
+                                offset);
+              }
+              if (!buffer) {
+                  GGML_ASSERT(tensor->buffer != nullptr);
+                  GGML_ASSERT(tensor->buffer->context != nullptr);
+                  GGML_LOG_INFO("[vulkan-legacy11] tensor device-buffer lookup begin: name=%s buffer_context=%p\n",
+                                tensor->name,
+                                tensor->buffer->context);
+                  auto buf_ctx = (ggml_backend_vk_buffer_context *) tensor->buffer->context;
+                  buffer = buf_ctx->dev_buffer;
+                  GGML_ASSERT(buffer != nullptr);
+                  offset = vk_tensor_offset(tensor) + tensor->view_offs;
+                  GGML_LOG_INFO("[vulkan-legacy11] tensor device-buffer lookup complete: name=%s vk_buffer_owner=%p vk_buffer=%p offset=%zu\n",
+                                tensor->name,
+                                (void *) buffer.get(),
+                                (void *) (VkBuffer) buffer->buffer,
+                                offset);
+              }
+              GGML_ASSERT(buffer != nullptr);
+              GGML_ASSERT((VkBuffer) buffer->buffer != VK_NULL_HANDLE);
+
+              size_t size = ggml_nbytes(tensor);
+              GGML_LOG_INFO("[vulkan-legacy11] tensor byte range resolved: name=%s offset=%zu size=%zu allocation=%zu\n",
+                            tensor->name,
+                            offset,
+                            size,
+                            buffer->size);
+
+              size_t misalign_bytes = offset & (ctx->device->properties.limits.minStorageBufferOffsetAlignment - 1);
+              GGML_ASSERT(allow_misalign || misalign_bytes == 0);
+              offset &= ~misalign_bytes;
+              size += misalign_bytes;
+              GGML_ASSERT(offset <= buffer->size);
+              GGML_ASSERT(size <= buffer->size - offset);
+              GGML_LOG_INFO("[vulkan-legacy11] tensor subbuffer complete: name=%s vk_buffer=%p offset=%zu range=%zu misalign=%zu\n",
+                            tensor->name,
+                            (void *) (VkBuffer) buffer->buffer,
+                            offset,
+                            size,
+                            misalign_bytes);
+
+              return vk_subbuffer{buffer, offset, size};
+          }
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkTensorSubbuffer)) {
+            throw "Expected Vulkan tensor-subbuffer function was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkTensorSubbuffer, $legacyVkTensorSubbuffer)
+
+          $oldVkCreateCommandBuffer = @'
+          static vk_command_buffer* ggml_vk_create_cmd_buffer(vk_device& device, vk_command_pool& p) {
+              VK_LOG_DEBUG("ggml_vk_create_cmd_buffer()");
+              vk::CommandBufferAllocateInfo command_buffer_alloc_info(
+                  p.pool,
+                  vk::CommandBufferLevel::ePrimary,
+                  1);
+              const std::vector<vk::CommandBuffer> cmd_buffers = device->device.allocateCommandBuffers(command_buffer_alloc_info);
+              p.cmd_buffers.push_back({ cmd_buffers.front(), 0, true });
+              return &p.cmd_buffers[p.cmd_buffers.size()-1];
+          }
+          '@
+
+          $legacyVkCreateCommandBuffer = @'
+          static vk_command_buffer* ggml_vk_create_cmd_buffer(vk_device& device, vk_command_pool& p) {
+              GGML_ASSERT(device != nullptr);
+              GGML_ASSERT((VkDevice) device->device != VK_NULL_HANDLE);
+              GGML_ASSERT((VkCommandPool) p.pool != VK_NULL_HANDLE);
+              GGML_LOG_INFO("[vulkan-legacy11] command-buffer allocation entry: device=%p pool=%p existing=%zu\n",
+                            (void *) device.get(),
+                            (void *) (VkCommandPool) p.pool,
+                            p.cmd_buffers.size());
+              VK_LOG_DEBUG("ggml_vk_create_cmd_buffer()");
+              vk::CommandBufferAllocateInfo command_buffer_alloc_info(
+                  p.pool,
+                  vk::CommandBufferLevel::ePrimary,
+                  1);
+              GGML_LOG_INFO("[vulkan-legacy11] command-buffer Vulkan allocation begin\n");
+              const std::vector<vk::CommandBuffer> cmd_buffers = device->device.allocateCommandBuffers(command_buffer_alloc_info);
+              GGML_LOG_INFO("[vulkan-legacy11] command-buffer Vulkan allocation returned: count=%zu\n",
+                            cmd_buffers.size());
+              GGML_ASSERT(cmd_buffers.size() == 1);
+              GGML_ASSERT((VkCommandBuffer) cmd_buffers.front() != VK_NULL_HANDLE);
+              p.cmd_buffers.push_back({ cmd_buffers.front(), 0, true });
+              GGML_LOG_INFO("[vulkan-legacy11] command-buffer allocation complete: command_buffer=%p total=%zu\n",
+                            (void *) (VkCommandBuffer) p.cmd_buffers.back().buf,
+                            p.cmd_buffers.size());
+              return &p.cmd_buffers[p.cmd_buffers.size()-1];
+          }
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkCreateCommandBuffer)) {
+            throw "Expected Vulkan command-buffer allocation function was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkCreateCommandBuffer, $legacyVkCreateCommandBuffer)
+
+          $oldVkBeginSubmission = @'
+          static vk_submission ggml_vk_begin_submission(vk_device& device, vk_command_pool& p, bool one_time = true) {
+              vk_submission s;
+              s.buffer = ggml_vk_get_or_create_cmd_buffer(device, p);
+              if (one_time) {
+                  s.buffer->buf.begin({ vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
+              } else {
+                  s.buffer->buf.begin({ vk::CommandBufferUsageFlags{} });
+              }
+
+              return s;
+          }
+          '@
+
+          $legacyVkBeginSubmission = @'
+          static vk_submission ggml_vk_begin_submission(vk_device& device, vk_command_pool& p, bool one_time = true) {
+              GGML_ASSERT(device != nullptr);
+              GGML_LOG_INFO("[vulkan-legacy11] submission begin entry: device=%p pool=%p one_time=%d\n",
+                            (void *) device.get(),
+                            (void *) (VkCommandPool) p.pool,
+                            one_time ? 1 : 0);
+              vk_submission s;
+              s.buffer = ggml_vk_get_or_create_cmd_buffer(device, p);
+              GGML_ASSERT(s.buffer != nullptr);
+              GGML_ASSERT((VkCommandBuffer) s.buffer->buf != VK_NULL_HANDLE);
+              GGML_LOG_INFO("[vulkan-legacy11] submission command buffer acquired: wrapper=%p command_buffer=%p use_counter=%llu\n",
+                            (void *) s.buffer,
+                            (void *) (VkCommandBuffer) s.buffer->buf,
+                            (unsigned long long) s.buffer->use_counter);
+              GGML_LOG_INFO("[vulkan-legacy11] command-buffer begin call: command_buffer=%p one_time=%d\n",
+                            (void *) (VkCommandBuffer) s.buffer->buf,
+                            one_time ? 1 : 0);
+              if (one_time) {
+                  s.buffer->buf.begin({ vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
+              } else {
+                  s.buffer->buf.begin({ vk::CommandBufferUsageFlags{} });
+              }
+              GGML_LOG_INFO("[vulkan-legacy11] command-buffer begin complete: command_buffer=%p\n",
+                            (void *) (VkCommandBuffer) s.buffer->buf);
+
+              return s;
+          }
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkBeginSubmission)) {
+            throw "Expected Vulkan submission-begin function was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkBeginSubmission, $legacyVkBeginSubmission)
+
+          $oldVkDispatchEntry = @'
+          template <typename T>
+          static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& subctx, vk_pipeline& pipeline, std::initializer_list<vk::DescriptorBufferInfo> const& descriptor_buffer_infos, const T &push_constants, std::array<uint32_t, 3> elements) {
+              const uint32_t wg0 = CEIL_DIV(elements[0], pipeline->wg_denoms[0]);
+              const uint32_t wg1 = CEIL_DIV(elements[1], pipeline->wg_denoms[1]);
+              const uint32_t wg2 = CEIL_DIV(elements[2], pipeline->wg_denoms[2]);
+          '@
+
+          $legacyVkDispatchEntry = @'
+          template <typename T>
+          static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& subctx, vk_pipeline& pipeline, std::initializer_list<vk::DescriptorBufferInfo> const& descriptor_buffer_infos, const T &push_constants, std::array<uint32_t, 3> elements) {
+              GGML_ASSERT(ctx != nullptr);
+              GGML_ASSERT(ctx->device != nullptr);
+              GGML_ASSERT(pipeline != nullptr);
+              GGML_ASSERT(subctx.s != nullptr);
+              GGML_ASSERT(subctx.s->buffer != nullptr);
+              GGML_ASSERT((VkDevice) ctx->device->device != VK_NULL_HANDLE);
+              GGML_ASSERT((VkCommandBuffer) subctx.s->buffer->buf != VK_NULL_HANDLE);
+              GGML_ASSERT((VkPipelineLayout) pipeline->layout != VK_NULL_HANDLE);
+              GGML_ASSERT((VkPipeline) pipeline->pipeline != VK_NULL_HANDLE);
+              GGML_LOG_INFO("[vulkan-legacy11] dispatch entry: ctx=%p device=%p pipeline=%p name=%s layout=%p pipeline_handle=%p command_buffer=%p descriptor_count=%zu descriptor_index=%zu descriptor_total=%zu elements=%u,%u,%u\n",
+                            (void *) ctx,
+                            (void *) ctx->device.get(),
+                            (void *) pipeline.get(),
+                            pipeline->name.c_str(),
+                            (void *) (VkPipelineLayout) pipeline->layout,
+                            (void *) (VkPipeline) pipeline->pipeline,
+                            (void *) (VkCommandBuffer) subctx.s->buffer->buf,
+                            descriptor_buffer_infos.size(),
+                            ctx->descriptor_set_idx,
+                            ctx->descriptor_sets.size(),
+                            elements[0],
+                            elements[1],
+                            elements[2]);
+              size_t descriptor_info_index = 0;
+              for (const auto & descriptor_info : descriptor_buffer_infos) {
+                  GGML_ASSERT((VkBuffer) descriptor_info.buffer != VK_NULL_HANDLE);
+                  GGML_LOG_INFO("[vulkan-legacy11] descriptor buffer validated: name=%s index=%zu buffer=%p offset=%llu range=%llu\n",
+                                pipeline->name.c_str(),
+                                descriptor_info_index,
+                                (void *) (VkBuffer) descriptor_info.buffer,
+                                (unsigned long long) descriptor_info.offset,
+                                (unsigned long long) descriptor_info.range);
+                  descriptor_info_index++;
+              }
+              const uint32_t wg0 = CEIL_DIV(elements[0], pipeline->wg_denoms[0]);
+              const uint32_t wg1 = CEIL_DIV(elements[1], pipeline->wg_denoms[1]);
+              const uint32_t wg2 = CEIL_DIV(elements[2], pipeline->wg_denoms[2]);
+              GGML_LOG_INFO("[vulkan-legacy11] dispatch workgroups resolved: name=%s workgroups=%u,%u,%u\n",
+                            pipeline->name.c_str(),
+                            wg0,
+                            wg1,
+                            wg2);
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkDispatchEntry)) {
+            throw "Expected Vulkan dispatch entry was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkDispatchEntry, $legacyVkDispatchEntry)
+
+          $oldVkDispatchCommands = @'
+              vk::DescriptorSet& descriptor_set = ctx->descriptor_sets[ctx->descriptor_set_idx++];
+              vk::WriteDescriptorSet write_descriptor_set{ descriptor_set, 0, 0, pipeline->parameter_count, vk::DescriptorType::eStorageBuffer, nullptr, descriptor_buffer_infos.begin() };
+              ctx->device->device.updateDescriptorSets({ write_descriptor_set }, {});
+
+              subctx->s->buffer->buf.pushConstants(pipeline->layout, vk::ShaderStageFlagBits::eCompute, 0, push_constant_size(push_constants), push_constant_data(push_constants));
+              subctx->s->buffer->buf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->pipeline);
+              subctx->s->buffer->buf.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
+                                          pipeline->layout,
+                                          0,
+                                          { descriptor_set },
+                                          {});
+              subctx->s->buffer->buf.dispatch(wg0, wg1, wg2);
+          '@
+
+          $legacyVkDispatchCommands = @'
+              vk::DescriptorSet& descriptor_set = ctx->descriptor_sets[ctx->descriptor_set_idx++];
+              GGML_ASSERT((VkDescriptorSet) descriptor_set != VK_NULL_HANDLE);
+              GGML_LOG_INFO("[vulkan-legacy11] descriptor set selected: name=%s set=%p index_used=%zu next_index=%zu\n",
+                            pipeline->name.c_str(),
+                            (void *) (VkDescriptorSet) descriptor_set,
+                            ctx->descriptor_set_idx - 1,
+                            ctx->descriptor_set_idx);
+              vk::WriteDescriptorSet write_descriptor_set{ descriptor_set, 0, 0, pipeline->parameter_count, vk::DescriptorType::eStorageBuffer, nullptr, descriptor_buffer_infos.begin() };
+              GGML_LOG_INFO("[vulkan-legacy11] descriptor update begin: name=%s set=%p count=%u\n",
+                            pipeline->name.c_str(),
+                            (void *) (VkDescriptorSet) descriptor_set,
+                            pipeline->parameter_count);
+              ctx->device->device.updateDescriptorSets({ write_descriptor_set }, {});
+              GGML_LOG_INFO("[vulkan-legacy11] descriptor update complete: name=%s\n",
+                            pipeline->name.c_str());
+
+              GGML_LOG_INFO("[vulkan-legacy11] push constants begin: name=%s bytes=%zu data=%p\n",
+                            pipeline->name.c_str(),
+                            push_constant_size(push_constants),
+                            (const void *) push_constant_data(push_constants));
+              subctx->s->buffer->buf.pushConstants(pipeline->layout, vk::ShaderStageFlagBits::eCompute, 0, push_constant_size(push_constants), push_constant_data(push_constants));
+              GGML_LOG_INFO("[vulkan-legacy11] push constants complete: name=%s\n",
+                            pipeline->name.c_str());
+              GGML_LOG_INFO("[vulkan-legacy11] pipeline bind begin: name=%s pipeline=%p\n",
+                            pipeline->name.c_str(),
+                            (void *) (VkPipeline) pipeline->pipeline);
+              subctx->s->buffer->buf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->pipeline);
+              GGML_LOG_INFO("[vulkan-legacy11] pipeline bind complete: name=%s\n",
+                            pipeline->name.c_str());
+              GGML_LOG_INFO("[vulkan-legacy11] descriptor-set bind begin: name=%s layout=%p set=%p\n",
+                            pipeline->name.c_str(),
+                            (void *) (VkPipelineLayout) pipeline->layout,
+                            (void *) (VkDescriptorSet) descriptor_set);
+              subctx->s->buffer->buf.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
+                                          pipeline->layout,
+                                          0,
+                                          { descriptor_set },
+                                          {});
+              GGML_LOG_INFO("[vulkan-legacy11] descriptor-set bind complete: name=%s\n",
+                            pipeline->name.c_str());
+              GGML_LOG_INFO("[vulkan-legacy11] dispatch record begin: name=%s workgroups=%u,%u,%u\n",
+                            pipeline->name.c_str(),
+                            wg0,
+                            wg1,
+                            wg2);
+              subctx->s->buffer->buf.dispatch(wg0, wg1, wg2);
+              GGML_LOG_INFO("[vulkan-legacy11] dispatch record complete: name=%s\n",
+                            pipeline->name.c_str());
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkDispatchCommands)) {
+            throw "Expected Vulkan descriptor and dispatch command block was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkDispatchCommands, $legacyVkDispatchCommands)
+
           $oldDeviceInit = @'
           static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const char * params) {
               UNUSED(params);
@@ -1150,6 +1654,11 @@ jobs:
           "vulkan_compile_condition_variable=disabled" | Add-Content $manifest
           "vulkan_compile_wait_strategy=atomic_polling" | Add-Content $manifest
           "vulkan_pipeline_completion_checkpoints=enabled" | Add-Content $manifest
+          "vulkan_descriptor_allocation_checkpoints=enabled" | Add-Content $manifest
+          "vulkan_descriptor_handle_validation=enabled" | Add-Content $manifest
+          "vulkan_tensor_subbuffer_checkpoints=enabled" | Add-Content $manifest
+          "vulkan_command_buffer_checkpoints=enabled" | Add-Content $manifest
+          "vulkan_dispatch_recording_checkpoints=enabled" | Add-Content $manifest
           "submodules:" | Add-Content $manifest
           git -C src submodule status | Add-Content $manifest
 
@@ -1192,7 +1701,7 @@ jobs:
           cat > release-notes.md <<'EOF'
           Experimental Windows x64 / Python 3.9 Vulkan compatibility wheel for llama-cpp-python 0.3.34 and legacy Intel Iris Xe driver stacks.
 
-          This build keeps the confirmed GGML and Vulkan-registry SRWLOCK fixes, direct registry-device binding, CPU host-buffer fallback, minimal Intel Xe feature profile, queue-lock compatibility fix, shader compile critical-section fix, r8 shader compatibility switches, and r9 cleanup-registry bypass. The r9 target log proved that compute-pipeline creation and compiled-state publication succeed, then the target faults exactly at condition_variable_any::notify_all(). R10 removes the compile condition variable, publishes completion through the existing atomic flag, and uses a Windows-compatible atomic polling wait for concurrent pipeline requests.
+          This build keeps the confirmed GGML and Vulkan-registry SRWLOCK fixes, direct registry-device binding, CPU host-buffer fallback, minimal Intel Xe feature profile, queue-lock compatibility fix, shader compile critical-section fix, r8 shader compatibility switches, r9 cleanup-registry bypass, and r10 atomic pipeline completion. The r10 target log proves pipeline creation and synchronization complete before the access violation. R11 is diagnostic only: it adds exact checkpoints and raw-handle validation across descriptor request/allocation, tensor-buffer resolution, command-buffer acquisition, descriptor updates, push constants, pipeline and descriptor binding, and dispatch recording.
 
           The GitHub Windows runner validated:
           - wheel packaging and clean Python 3.9 installation
@@ -1208,7 +1717,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: v0.3.34-win39-vulkan-xelegacy-r10
+          RELEASE_TAG: v0.3.34-win39-vulkan-xelegacy-r11
           RELEASE_TARGET: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           mapfile -d '' assets < <(find release-assets -type f -print0)
