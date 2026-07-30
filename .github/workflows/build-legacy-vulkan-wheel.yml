@@ -9,7 +9,7 @@ permissions:
 
 env:
   SOURCE_VERSION: "0.3.34"
-  PACKAGE_VERSION: "0.3.34+win.srw.vulkan.xelegacy11"
+  PACKAGE_VERSION: "0.3.34+win.srw.vulkan.xelegacy12"
   VULKAN_SDK_VERSION: "1.4.341.0"
 
 jobs:
@@ -1485,6 +1485,346 @@ jobs:
           }
           $vulkanSource = $vulkanSource.Replace($oldVkDispatchCommands, $legacyVkDispatchCommands)
 
+          $oldVkBuildGraphCaller = @'
+              bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
+          '@
+
+          $legacyVkBuildGraphCaller = @'
+              GGML_LOG_INFO("[vulkan-legacy12] graph node build call begin: node_index=%d op=%s submit=%d last=%d\n",
+                            i,
+                            ggml_op_name(cgraph->nodes[i]->op),
+                            submit ? 1 : 0,
+                            (i + ctx->num_additional_fused_ops >= last_node) ? 1 : 0);
+              bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
+              GGML_LOG_INFO("[vulkan-legacy12] graph node build call complete: node_index=%d op=%s enqueued=%d\n",
+                            i,
+                            ggml_op_name(cgraph->nodes[i]->op),
+                            enqueued ? 1 : 0);
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkBuildGraphCaller)) {
+            throw "Expected Vulkan graph-build caller was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkBuildGraphCaller, $legacyVkBuildGraphCaller)
+
+          $oldVkBuildGraphTail = @'
+              ctx->tensor_ctxs[node_idx] = compute_ctx;
+
+          #if defined(GGML_VULKAN_CHECK_RESULTS)
+              // Force context reset on each node so that each tensor ends up in its own context
+              // and can be run and compared to its CPU equivalent separately
+              last_node = true;
+          #endif
+
+              if (submit || last_node) {
+                  ggml_vk_ctx_end(compute_ctx);
+
+                  // TODO probably it'd be better to pass a exit_node flag to ggml_vk_compute_forward
+                  if (last_node) {
+                      compute_ctx->exit_tensor_idx = node_idx_begin;
+                  }
+                  else {
+                      compute_ctx->exit_tensor_idx = -1;
+                  }
+
+                  ctx->compute_ctx.reset();
+
+                  ggml_vk_compute_forward(ctx, cgraph, node_begin, node_idx_begin, almost_ready);
+              }
+              return true;
+          }
+          '@
+
+          $legacyVkBuildGraphTail = @'
+              GGML_LOG_INFO("[vulkan-legacy12] graph operation returned: node_index=%d op=%s compute_ctx=%p\n",
+                            node_idx,
+                            ggml_op_name(node->op),
+                            (void *) compute_ctx.get());
+              ctx->tensor_ctxs[node_idx] = compute_ctx;
+              GGML_LOG_INFO("[vulkan-legacy12] tensor context stored: node_index=%d\n", node_idx);
+
+          #if defined(GGML_VULKAN_CHECK_RESULTS)
+              // Force context reset on each node so that each tensor ends up in its own context
+              // and can be run and compared to its CPU equivalent separately
+              last_node = true;
+          #endif
+
+              if (submit || last_node) {
+                  GGML_LOG_INFO("[vulkan-legacy12] graph context end requested: node_index=%d submit=%d last=%d\n",
+                                node_idx,
+                                submit ? 1 : 0,
+                                last_node ? 1 : 0);
+                  ggml_vk_ctx_end(compute_ctx);
+                  GGML_LOG_INFO("[vulkan-legacy12] graph context end returned: node_index=%d\n", node_idx);
+
+                  // TODO probably it'd be better to pass a exit_node flag to ggml_vk_compute_forward
+                  if (last_node) {
+                      compute_ctx->exit_tensor_idx = node_idx_begin;
+                  }
+                  else {
+                      compute_ctx->exit_tensor_idx = -1;
+                  }
+
+                  ctx->compute_ctx.reset();
+                  GGML_LOG_INFO("[vulkan-legacy12] backend compute context reset: node_index=%d exit_tensor_idx=%d\n",
+                                node_idx,
+                                compute_ctx->exit_tensor_idx);
+
+                  GGML_LOG_INFO("[vulkan-legacy12] compute-forward call begin: node_index=%d\n", node_idx);
+                  ggml_vk_compute_forward(ctx, cgraph, node_begin, node_idx_begin, almost_ready);
+                  GGML_LOG_INFO("[vulkan-legacy12] compute-forward call complete: node_index=%d\n", node_idx);
+              }
+              GGML_LOG_INFO("[vulkan-legacy12] graph build return true: node_index=%d\n", node_idx);
+              return true;
+          }
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkBuildGraphTail)) {
+            throw "Expected Vulkan graph-build tail was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkBuildGraphTail, $legacyVkBuildGraphTail)
+
+          $oldVkCtxEnd = @'
+          static void ggml_vk_ctx_end(vk_context& ctx) {
+              VK_LOG_DEBUG("ggml_vk_ctx_end(" << ctx << ", " << ctx->seqs.size() << ")");
+              if (ctx->s == nullptr) {
+                  return;
+              }
+
+              ctx->s->buffer->buf.end();
+              ctx->s = nullptr;
+          }
+          '@
+
+          $legacyVkCtxEnd = @'
+          static void ggml_vk_ctx_end(vk_context& ctx) {
+              VK_LOG_DEBUG("ggml_vk_ctx_end(" << ctx << ", " << ctx->seqs.size() << ")");
+              GGML_LOG_INFO("[vulkan-legacy12] context end entry: ctx=%p sequences=%zu active_submission=%p\n",
+                            (void *) ctx.get(),
+                            ctx->seqs.size(),
+                            (void *) ctx->s);
+              if (ctx->s == nullptr) {
+                  GGML_LOG_INFO("[vulkan-legacy12] context end bypassed: no active submission\n");
+                  return;
+              }
+
+              GGML_ASSERT(ctx->s->buffer != nullptr);
+              GGML_ASSERT((VkCommandBuffer) ctx->s->buffer->buf != VK_NULL_HANDLE);
+              GGML_LOG_INFO("[vulkan-legacy12] command-buffer end begin: wrapper=%p command_buffer=%p\n",
+                            (void *) ctx->s->buffer,
+                            (void *) (VkCommandBuffer) ctx->s->buffer->buf);
+              ctx->s->buffer->buf.end();
+              GGML_LOG_INFO("[vulkan-legacy12] command-buffer end complete: command_buffer=%p\n",
+                            (void *) (VkCommandBuffer) ctx->s->buffer->buf);
+              ctx->s = nullptr;
+              GGML_LOG_INFO("[vulkan-legacy12] active submission cleared\n");
+          }
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkCtxEnd)) {
+            throw "Expected Vulkan context-end function was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkCtxEnd, $legacyVkCtxEnd)
+
+          $oldVkSubmitTail = @'
+              ctx->p->q->queue.submit(submit_infos, fence);
+
+              ctx->seqs.clear();
+          '@
+
+          $legacyVkSubmitTail = @'
+              GGML_ASSERT(ctx->p != nullptr);
+              GGML_ASSERT(ctx->p->q != nullptr);
+              GGML_ASSERT((VkQueue) ctx->p->q->queue != VK_NULL_HANDLE);
+              GGML_LOG_INFO("[vulkan-legacy12] queue submit begin: ctx=%p queue=%p submissions=%zu fence=%p\n",
+                            (void *) ctx.get(),
+                            (void *) (VkQueue) ctx->p->q->queue,
+                            submit_infos.size(),
+                            (void *) (VkFence) fence);
+              ctx->p->q->queue.submit(submit_infos, fence);
+              GGML_LOG_INFO("[vulkan-legacy12] queue submit complete: submissions=%zu\n",
+                            submit_infos.size());
+
+              ctx->seqs.clear();
+              GGML_LOG_INFO("[vulkan-legacy12] submitted sequence registry cleared\n");
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkSubmitTail)) {
+            throw "Expected Vulkan queue-submit tail was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkSubmitTail, $legacyVkSubmitTail)
+
+          $oldVkFenceWait = @'
+              // Spin (w/pause) waiting for the graph to finish executing.
+              vk::Result result;
+              while ((result = ctx->device->device.getFenceStatus(ctx->fence)) != vk::Result::eSuccess) {
+                  if (result != vk::Result::eNotReady) {
+                      fprintf(stderr, "ggml_vulkan: error %s at %s:%d\n", to_string(result).c_str(), __FILE__, __LINE__);
+                      exit(1);
+                  }
+                  for (uint32_t i = 0; i < 100; ++i) {
+                      YIELD();
+                      YIELD();
+                      YIELD();
+                      YIELD();
+                      YIELD();
+                      YIELD();
+                      YIELD();
+                      YIELD();
+                      YIELD();
+                      YIELD();
+                  }
+              }
+              ctx->device->device.resetFences({ ctx->fence });
+          '@
+
+          $legacyVkFenceWait = @'
+              // Spin (w/pause) waiting for the graph to finish executing.
+              GGML_ASSERT((VkDevice) ctx->device->device != VK_NULL_HANDLE);
+              GGML_ASSERT((VkFence) ctx->fence != VK_NULL_HANDLE);
+              GGML_LOG_INFO("[vulkan-legacy12] fence polling begin: fence=%p\n",
+                            (void *) (VkFence) ctx->fence);
+              vk::Result result;
+              uint64_t poll_count = 0;
+              while ((result = ctx->device->device.getFenceStatus(ctx->fence)) != vk::Result::eSuccess) {
+                  if (result != vk::Result::eNotReady) {
+                      fprintf(stderr, "ggml_vulkan: error %s at %s:%d\n", to_string(result).c_str(), __FILE__, __LINE__);
+                      exit(1);
+                  }
+                  poll_count++;
+                  for (uint32_t i = 0; i < 100; ++i) {
+                      YIELD();
+                      YIELD();
+                      YIELD();
+                      YIELD();
+                      YIELD();
+                      YIELD();
+                      YIELD();
+                      YIELD();
+                      YIELD();
+                      YIELD();
+                  }
+              }
+              GGML_LOG_INFO("[vulkan-legacy12] fence signaled: fence=%p polls=%llu\n",
+                            (void *) (VkFence) ctx->fence,
+                            (unsigned long long) poll_count);
+              GGML_LOG_INFO("[vulkan-legacy12] fence reset begin: fence=%p\n",
+                            (void *) (VkFence) ctx->fence);
+              ctx->device->device.resetFences({ ctx->fence });
+              GGML_LOG_INFO("[vulkan-legacy12] fence reset complete: fence=%p\n",
+                            (void *) (VkFence) ctx->fence);
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkFenceWait)) {
+            throw "Expected Vulkan fence polling block was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkFenceWait, $legacyVkFenceWait)
+
+          $oldVkComputeForwardSubmit = @'
+                  if (almost_ready && !ctx->almost_ready_fence_pending) {
+                      ggml_vk_submit(subctx, ctx->almost_ready_fence);
+                      ctx->almost_ready_fence_pending = true;
+                  } else {
+                      ggml_vk_submit(subctx, {});
+                  }
+                  ctx->submit_pending = true;
+          '@
+
+          $legacyVkComputeForwardSubmit = @'
+                  GGML_LOG_INFO("[vulkan-legacy12] compute-forward submission begin: subctx=%p sequences=%zu almost_ready=%d pending_almost_ready=%d\n",
+                                (void *) subctx.get(),
+                                subctx->seqs.size(),
+                                almost_ready ? 1 : 0,
+                                ctx->almost_ready_fence_pending ? 1 : 0);
+                  if (almost_ready && !ctx->almost_ready_fence_pending) {
+                      ggml_vk_submit(subctx, ctx->almost_ready_fence);
+                      ctx->almost_ready_fence_pending = true;
+                  } else {
+                      ggml_vk_submit(subctx, {});
+                  }
+                  GGML_LOG_INFO("[vulkan-legacy12] compute-forward submission complete: remaining_sequences=%zu\n",
+                                subctx->seqs.size());
+                  ctx->submit_pending = true;
+                  GGML_LOG_INFO("[vulkan-legacy12] backend submit-pending set\n");
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkComputeForwardSubmit)) {
+            throw "Expected Vulkan compute-forward submission block was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkComputeForwardSubmit, $legacyVkComputeForwardSubmit)
+
+          $oldVkSynchronizeCore = @'
+                  ggml_vk_ctx_end(compute_ctx);
+
+                  for (auto& cpy : compute_ctx->in_memcpys) {
+                      memcpy(cpy.dst, cpy.src, cpy.n);
+                  }
+
+                  ggml_vk_submit(compute_ctx, {});
+                  ctx->submit_pending = true;
+          '@
+
+          $legacyVkSynchronizeCore = @'
+                  GGML_LOG_INFO("[vulkan-legacy12] synchronize context end begin: compute_ctx=%p\n",
+                                (void *) compute_ctx.get());
+                  ggml_vk_ctx_end(compute_ctx);
+                  GGML_LOG_INFO("[vulkan-legacy12] synchronize context end complete\n");
+
+                  for (auto& cpy : compute_ctx->in_memcpys) {
+                      memcpy(cpy.dst, cpy.src, cpy.n);
+                  }
+                  GGML_LOG_INFO("[vulkan-legacy12] synchronize input copies complete: count=%zu\n",
+                                compute_ctx->in_memcpys.size());
+
+                  GGML_LOG_INFO("[vulkan-legacy12] synchronize queued-work submit begin\n");
+                  ggml_vk_submit(compute_ctx, {});
+                  GGML_LOG_INFO("[vulkan-legacy12] synchronize queued-work submit complete\n");
+                  ctx->submit_pending = true;
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkSynchronizeCore)) {
+            throw "Expected Vulkan synchronize core block was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkSynchronizeCore, $legacyVkSynchronizeCore)
+
+          $oldVkFinalFence = @'
+                      ctx->device->compute_queue.queue.submit({}, ctx->fence);
+                  }
+                  ggml_vk_wait_for_fence(ctx);
+                  ctx->submit_pending = false;
+                  if (cmd_buf) {
+                      cmd_buf->in_use = false;
+                      cmd_buf->buf.reset();
+                  }
+          '@
+
+          $legacyVkFinalFence = @'
+                      GGML_LOG_INFO("[vulkan-legacy12] empty fence-submit begin: queue=%p fence=%p\n",
+                                    (void *) (VkQueue) ctx->device->compute_queue.queue,
+                                    (void *) (VkFence) ctx->fence);
+                      ctx->device->compute_queue.queue.submit({}, ctx->fence);
+                      GGML_LOG_INFO("[vulkan-legacy12] empty fence-submit complete\n");
+                  }
+                  GGML_LOG_INFO("[vulkan-legacy12] fence wait call begin\n");
+                  ggml_vk_wait_for_fence(ctx);
+                  GGML_LOG_INFO("[vulkan-legacy12] fence wait call complete\n");
+                  ctx->submit_pending = false;
+                  GGML_LOG_INFO("[vulkan-legacy12] backend submit-pending cleared\n");
+                  if (cmd_buf) {
+                      GGML_LOG_INFO("[vulkan-legacy12] command-buffer reset begin: wrapper=%p command_buffer=%p\n",
+                                    (void *) cmd_buf,
+                                    (void *) (VkCommandBuffer) cmd_buf->buf);
+                      cmd_buf->in_use = false;
+                      cmd_buf->buf.reset();
+                      GGML_LOG_INFO("[vulkan-legacy12] command-buffer reset complete\n");
+                  }
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkFinalFence)) {
+            throw "Expected Vulkan final fence-submit block was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkFinalFence, $legacyVkFinalFence)
+
           $oldDeviceInit = @'
           static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const char * params) {
               UNUSED(params);
@@ -1659,6 +1999,11 @@ jobs:
           "vulkan_tensor_subbuffer_checkpoints=enabled" | Add-Content $manifest
           "vulkan_command_buffer_checkpoints=enabled" | Add-Content $manifest
           "vulkan_dispatch_recording_checkpoints=enabled" | Add-Content $manifest
+          "vulkan_graph_return_checkpoints=enabled" | Add-Content $manifest
+          "vulkan_command_buffer_end_checkpoints=enabled" | Add-Content $manifest
+          "vulkan_queue_submit_checkpoints=enabled" | Add-Content $manifest
+          "vulkan_fence_wait_checkpoints=enabled" | Add-Content $manifest
+          "vulkan_command_buffer_reset_checkpoints=enabled" | Add-Content $manifest
           "submodules:" | Add-Content $manifest
           git -C src submodule status | Add-Content $manifest
 
@@ -1701,7 +2046,7 @@ jobs:
           cat > release-notes.md <<'EOF'
           Experimental Windows x64 / Python 3.9 Vulkan compatibility wheel for llama-cpp-python 0.3.34 and legacy Intel Iris Xe driver stacks.
 
-          This build keeps the confirmed GGML and Vulkan-registry SRWLOCK fixes, direct registry-device binding, CPU host-buffer fallback, minimal Intel Xe feature profile, queue-lock compatibility fix, shader compile critical-section fix, r8 shader compatibility switches, r9 cleanup-registry bypass, and r10 atomic pipeline completion. The r10 target log proves pipeline creation and synchronization complete before the access violation. R11 is diagnostic only: it adds exact checkpoints and raw-handle validation across descriptor request/allocation, tensor-buffer resolution, command-buffer acquisition, descriptor updates, push constants, pipeline and descriptor binding, and dispatch recording.
+          This build keeps the confirmed GGML and Vulkan-registry SRWLOCK fixes, direct registry-device binding, CPU host-buffer fallback, minimal Intel Xe feature profile, queue-lock compatibility fix, shader compile critical-section fix, r8 shader compatibility switches, r9 cleanup-registry bypass, r10 atomic pipeline completion, and r11 descriptor/dispatch diagnostics. The r11 target log proves descriptor updates, push constants, pipeline binding, descriptor-set binding, and vkCmdDispatch recording all complete. R12 is diagnostic only: it traces return from the dispatched operation and graph builder, command-buffer finalization, queue submission, fence polling/reset, command-buffer reset, and context cleanup.
 
           The GitHub Windows runner validated:
           - wheel packaging and clean Python 3.9 installation
@@ -1717,7 +2062,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: v0.3.34-win39-vulkan-xelegacy-r11
+          RELEASE_TAG: v0.3.34-win39-vulkan-xelegacy-r12
           RELEASE_TARGET: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           mapfile -d '' assets < <(find release-assets -type f -print0)
