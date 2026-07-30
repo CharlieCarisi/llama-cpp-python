@@ -1896,8 +1896,8 @@ jobs:
           # removing the r5-r13 diagnostic flood from normal inference.
           $legacyDiagnosticLogs = [regex]'(?ms)^[ \t]*GGML_LOG_INFO\("\[vulkan-legacy(?:\d+)?\].*?\);\r?\n'
           $legacyDiagnosticLogMatches = $legacyDiagnosticLogs.Matches($vulkanSource)
-          if ($legacyDiagnosticLogMatches.Count -ne 160) {
-            throw "Expected 160 legacy diagnostic log calls, found $($legacyDiagnosticLogMatches.Count)"
+          if ($legacyDiagnosticLogMatches.Count -ne 166) {
+            throw "Expected 166 legacy diagnostic log calls, found $($legacyDiagnosticLogMatches.Count)"
           }
           $vulkanSource = $legacyDiagnosticLogs.Replace($vulkanSource, "")
           if ($vulkanSource.Contains('GGML_LOG_INFO("[vulkan-legacy')) {
@@ -2125,7 +2125,7 @@ jobs:
           cat > release-notes.md <<'EOF'
           Production Windows x64 / Python 3.9 Vulkan compatibility wheel for llama-cpp-python 0.3.34 on the validated legacy Intel Iris Xe workstation.
 
-          This r14 build preserves the compatibility behavior proven by r13, including the GGML, Vulkan registry, per-device, shader-compilation, and global queue SRWLOCK fixes; direct registry-device binding; CPU host-buffer fallback; conservative Intel Xe feature profile; synchronous backend execution; cleanup-registry bypass; and atomic pipeline completion. The 160 temporary r5-r13 diagnostic log calls are removed for normal production use.
+          This r14 build preserves the compatibility behavior proven by r13, including the GGML, Vulkan registry, per-device, shader-compilation, and global queue SRWLOCK fixes; direct registry-device binding; CPU host-buffer fallback; conservative Intel Xe feature profile; synchronous backend execution; cleanup-registry bypass; and atomic pipeline completion. The 166 temporary r5-r13 diagnostic log calls are removed for normal production use.
 
           Validation:
           - Target Iris Xe workstation: one-layer Vulkan inference completed 20 tokens, repeated queue submissions and fence waits, and clean shutdown at 3.70 tokens/s with r13.
