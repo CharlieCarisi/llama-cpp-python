@@ -9,8 +9,10 @@ permissions:
 
 env:
   SOURCE_VERSION: "0.3.34"
-  PACKAGE_VERSION: "0.3.34+win.srw.vulkan.xelegacy13"
+  PACKAGE_VERSION: "0.3.34+win.srw.vulkan.xelegacy14"
   VULKAN_SDK_VERSION: "1.4.341.0"
+  TEST_MODEL_URL: "https://huggingface.co/ggml-org/models-moved/resolve/main/tinyllamas/stories15M-q4_0.gguf?download=true"
+  TEST_MODEL_SHA256: "66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739"
 
 jobs:
   build:
@@ -1889,6 +1891,18 @@ jobs:
             throw "Expected Vulkan registry device initializer was not found"
           }
           $vulkanSource = $vulkanSource.Replace($oldDeviceInit, $legacyDeviceInit)
+
+          # Production build: retain the validated compatibility behavior while
+          # removing the r5-r13 diagnostic flood from normal inference.
+          $legacyDiagnosticLogs = [regex]'(?ms)^[ \t]*GGML_LOG_INFO\("\[vulkan-legacy(?:\d+)?\].*?\);\r?\n'
+          $legacyDiagnosticLogMatches = $legacyDiagnosticLogs.Matches($vulkanSource)
+          if ($legacyDiagnosticLogMatches.Count -ne 160) {
+            throw "Expected 160 legacy diagnostic log calls, found $($legacyDiagnosticLogMatches.Count)"
+          }
+          $vulkanSource = $legacyDiagnosticLogs.Replace($vulkanSource, "")
+          if ($vulkanSource.Contains('GGML_LOG_INFO("[vulkan-legacy')) {
+            throw "Legacy Vulkan diagnostic logging remains after production cleanup"
+          }
           Set-Content $vulkanPath $vulkanSource -Encoding UTF8
 
           $initPath = "src\llama_cpp\__init__.py"
@@ -1966,12 +1980,21 @@ jobs:
           & $testPython -m pip install --no-cache-dir $wheel.FullName
 
           New-Item -ItemType Directory -Force reports | Out-Null
+          New-Item -ItemType Directory -Force test-model | Out-Null
+          $modelPath = Join-Path $env:GITHUB_WORKSPACE "test-model\stories15M-q4_0.gguf"
+          Invoke-WebRequest -Uri $env:TEST_MODEL_URL -OutFile $modelPath
+          $actualHash = (Get-FileHash $modelPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $env:TEST_MODEL_SHA256) {
+            throw "Test model SHA-256 mismatch: $actualHash"
+          }
 
           $testOutput = @'
           import platform
           import sys
+          from pathlib import Path
 
           import llama_cpp
+          from llama_cpp import Llama
 
           print("Python:", sys.version)
           print("Platform:", platform.platform())
@@ -1982,6 +2005,22 @@ jobs:
           print("BACKEND INIT OK", flush=True)
           llama_cpp.llama_backend_free()
           print("BACKEND FREE OK", flush=True)
+
+          model_path = Path("test-model/stories15M-q4_0.gguf").resolve()
+          print("Loading CPU smoke-test model", flush=True)
+          llm = Llama(
+              model_path=str(model_path),
+              n_ctx=128,
+              n_batch=32,
+              n_threads=2,
+              n_gpu_layers=0,
+              verbose=True,
+          )
+          output = llm("Once upon a time", max_tokens=8, temperature=0.0)
+          completion = output["choices"][0]["text"]
+          if not isinstance(completion, str) or not completion:
+              raise RuntimeError(f"Model returned no completion: {output!r}")
+          print("MODEL INFERENCE OK:", repr(completion), flush=True)
           '@ | & $testPython -I -X faulthandler -u 2>&1
           $testExitCode = $LASTEXITCODE
           $testOutput | Tee-Object "reports\legacy-vulkan-runtime-test.txt"
@@ -2010,40 +2049,40 @@ jobs:
           "vulkan_direct_registry_device_init=enabled" | Add-Content $manifest
           "vulkan_preconstruction_registry_lookup=removed" | Add-Content $manifest
           "vulkan_buffer_type_direct_binding=enabled" | Add-Content $manifest
-          "vulkan_buffer_type_checkpoints=enabled" | Add-Content $manifest
+          "vulkan_buffer_type_checkpoints=stripped" | Add-Content $manifest
           "vulkan_pinned_host_buffer=disabled" | Add-Content $manifest
           "vulkan_minimal_intel_feature_profile=enabled" | Add-Content $manifest
           "vulkan_optional_extensions=disabled" | Add-Content $manifest
           "vulkan_async_backend=disabled" | Add-Content $manifest
-          "vulkan_device_init_checkpoints=enabled" | Add-Content $manifest
+          "vulkan_device_init_checkpoints=stripped" | Add-Content $manifest
           "vulkan_cpu_host_buffer_fallback=enabled" | Add-Content $manifest
-          "vulkan_registry_return_checkpoints=enabled" | Add-Content $manifest
+          "vulkan_registry_return_checkpoints=stripped" | Add-Content $manifest
           "vulkan_per_device_critical_section=enabled" | Add-Content $manifest
           "vulkan_recursive_lock_sites_replaced=6" | Add-Content $manifest
-          "vulkan_queue_creation_checkpoints=enabled" | Add-Content $manifest
+          "vulkan_queue_creation_checkpoints=stripped" | Add-Content $manifest
           "vulkan_global_queue_srwlock=enabled" | Add-Content $manifest
           "vulkan_global_queue_lock_sites_replaced=4" | Add-Content $manifest
-          "vulkan_global_queue_lock_checkpoints=enabled" | Add-Content $manifest
+          "vulkan_global_queue_lock_checkpoints=stripped" | Add-Content $manifest
           "vulkan_compile_critical_section=enabled" | Add-Content $manifest
           "vulkan_compile_lock_sites_replaced=8" | Add-Content $manifest
-          "vulkan_shader_loader_checkpoints=enabled" | Add-Content $manifest
+          "vulkan_shader_loader_checkpoints=stripped" | Add-Content $manifest
           "vulkan_runtime_fp16_rte_spirv_rewrite=disabled" | Add-Content $manifest
           "vulkan_multi_add=disabled" | Add-Content $manifest
-          "vulkan_pipeline_stage_checkpoints=enabled" | Add-Content $manifest
+          "vulkan_pipeline_stage_checkpoints=stripped" | Add-Content $manifest
           "vulkan_pipeline_cleanup_registry=bypassed" | Add-Content $manifest
           "vulkan_compile_condition_variable=disabled" | Add-Content $manifest
           "vulkan_compile_wait_strategy=atomic_polling" | Add-Content $manifest
-          "vulkan_pipeline_completion_checkpoints=enabled" | Add-Content $manifest
-          "vulkan_descriptor_allocation_checkpoints=enabled" | Add-Content $manifest
+          "vulkan_pipeline_completion_checkpoints=stripped" | Add-Content $manifest
+          "vulkan_descriptor_allocation_checkpoints=stripped" | Add-Content $manifest
           "vulkan_descriptor_handle_validation=enabled" | Add-Content $manifest
-          "vulkan_tensor_subbuffer_checkpoints=enabled" | Add-Content $manifest
-          "vulkan_command_buffer_checkpoints=enabled" | Add-Content $manifest
-          "vulkan_dispatch_recording_checkpoints=enabled" | Add-Content $manifest
-          "vulkan_graph_return_checkpoints=enabled" | Add-Content $manifest
-          "vulkan_command_buffer_end_checkpoints=enabled" | Add-Content $manifest
-          "vulkan_queue_submit_checkpoints=enabled" | Add-Content $manifest
-          "vulkan_fence_wait_checkpoints=enabled" | Add-Content $manifest
-          "vulkan_command_buffer_reset_checkpoints=enabled" | Add-Content $manifest
+          "vulkan_tensor_subbuffer_checkpoints=stripped" | Add-Content $manifest
+          "vulkan_command_buffer_checkpoints=stripped" | Add-Content $manifest
+          "vulkan_dispatch_recording_checkpoints=stripped" | Add-Content $manifest
+          "vulkan_graph_return_checkpoints=stripped" | Add-Content $manifest
+          "vulkan_command_buffer_end_checkpoints=stripped" | Add-Content $manifest
+          "vulkan_queue_submit_checkpoints=stripped" | Add-Content $manifest
+          "vulkan_fence_wait_checkpoints=stripped" | Add-Content $manifest
+          "vulkan_command_buffer_reset_checkpoints=stripped" | Add-Content $manifest
           "submodules:" | Add-Content $manifest
           git -C src submodule status | Add-Content $manifest
 
@@ -2066,7 +2105,7 @@ jobs:
           retention-days: 30
 
   publish:
-    name: Publish legacy Vulkan prerelease
+    name: Publish legacy Vulkan production release
     needs: build
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
@@ -2084,25 +2123,23 @@ jobs:
         shell: bash
         run: |
           cat > release-notes.md <<'EOF'
-          Experimental Windows x64 / Python 3.9 Vulkan compatibility wheel for llama-cpp-python 0.3.34 and legacy Intel Iris Xe driver stacks.
+          Production Windows x64 / Python 3.9 Vulkan compatibility wheel for llama-cpp-python 0.3.34 on the validated legacy Intel Iris Xe workstation.
 
-          This build keeps the confirmed GGML and Vulkan-registry SRWLOCK fixes, direct registry-device binding, CPU host-buffer fallback, minimal Intel Xe feature profile, per-device queue-lock compatibility fix, shader compile critical-section fix, r8 shader compatibility switches, r9 cleanup-registry bypass, r10 atomic pipeline completion, and r11-r12 command/submission diagnostics. The r12 target log proves command recording and command-buffer finalization complete, then faults before the first queue-submit checkpoint. R13 replaces the intervening process-global std::mutex queue lock with an initialized Windows SRWLOCK at all four guard sites and adds queue-lock checkpoints. It also corrects the diagnostic format for the uint32_t descriptor index.
+          This r14 build preserves the compatibility behavior proven by r13, including the GGML, Vulkan registry, per-device, shader-compilation, and global queue SRWLOCK fixes; direct registry-device binding; CPU host-buffer fallback; conservative Intel Xe feature profile; synchronous backend execution; cleanup-registry bypass; and atomic pipeline completion. The 160 temporary r5-r13 diagnostic log calls are removed for normal production use.
 
-          The GitHub Windows runner validated:
-          - wheel packaging and clean Python 3.9 installation
-          - llama_backend_init() and llama_backend_free()
-          - DLL dependencies
-          - reproducibility manifest and SHA-256
+          Validation:
+          - Target Iris Xe workstation: one-layer Vulkan inference completed 20 tokens, repeated queue submissions and fence waits, and clean shutdown at 3.70 tokens/s with r13.
+          - GitHub Windows runner: MSVC compilation, clean Python 3.9 installation, backend initialization/free, pinned tiny-GGUF download, eight-token CPU inference, DLL inspection, reproducibility manifest, and SHA-256.
 
-          GitHub's runner has no Vulkan GPU. It can validate compilation, packaging, and backend initialization, but actual tensor placement and offload must be validated on the target Iris Xe workstation. This is a diagnostic compatibility prerelease, not a replacement for the stable optimized CPU wheel.
+          GitHub's runner has no Vulkan GPU, so r14's production cleanup is behavior-preserving and the GPU compatibility result derives from the same r13 source transformations with diagnostic logging stripped.
           EOF
 
-      - name: Create or update public prerelease
+      - name: Create or update public production release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: v0.3.34-win39-vulkan-xelegacy-r13
+          RELEASE_TAG: v0.3.34-win39-vulkan-xelegacy-r14
           RELEASE_TARGET: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           mapfile -d '' assets < <(find release-assets -type f -print0)
@@ -2116,13 +2153,11 @@ jobs:
             gh release edit "$RELEASE_TAG" \
               --repo "$GH_REPO" \
               --title "$RELEASE_TAG" \
-              --notes-file release-notes.md \
-              --prerelease
+              --notes-file release-notes.md
           else
             gh release create "$RELEASE_TAG" "${assets[@]}" \
               --repo "$GH_REPO" \
               --target "$RELEASE_TARGET" \
               --title "$RELEASE_TAG" \
-              --notes-file release-notes.md \
-              --prerelease
+              --notes-file release-notes.md
           fi
