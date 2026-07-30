@@ -9,7 +9,7 @@ permissions:
 
 env:
   SOURCE_VERSION: "0.3.34"
-  PACKAGE_VERSION: "0.3.34+win.srw.vulkan.xelegacy12"
+  PACKAGE_VERSION: "0.3.34+win.srw.vulkan.xelegacy13"
   VULKAN_SDK_VERSION: "1.4.341.0"
 
 jobs:
@@ -709,6 +709,43 @@ jobs:
           }
           $vulkanSource = $vulkanSource.Replace($oldVkCreateQueueHelper, $legacyVkCreateQueueHelper)
 
+          # Command-buffer finalization succeeds on the target, but execution
+          # faults before the first queue-submit checkpoint. Replace the
+          # intervening process-global queue mutex with an initialized SRWLOCK.
+          $oldVkQueueMutex = 'static std::mutex queue_mutex;'
+          $legacyVkQueueMutex = @'
+          static SRWLOCK queue_lock = SRWLOCK_INIT;
+
+          struct ggml_vk_queue_lock_guard {
+              SRWLOCK * lock;
+
+              explicit ggml_vk_queue_lock_guard(SRWLOCK * lock) : lock(lock) {
+                  AcquireSRWLockExclusive(lock);
+              }
+
+              ~ggml_vk_queue_lock_guard() {
+                  ReleaseSRWLockExclusive(lock);
+              }
+          };
+          '@
+
+          if (-not $vulkanSource.Contains($oldVkQueueMutex)) {
+            throw "Expected Vulkan global queue mutex was not found"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkQueueMutex, $legacyVkQueueMutex)
+
+          $oldVkQueueGuard = 'std::lock_guard<std::mutex> guard(queue_mutex);'
+          $legacyVkQueueGuard = @'
+              GGML_LOG_INFO("[vulkan-legacy13] queue lock enter begin\n");
+              ggml_vk_queue_lock_guard guard(&queue_lock);
+              GGML_LOG_INFO("[vulkan-legacy13] queue lock acquired\n");
+          '@
+          $queueGuardMatches = ([regex]::Matches($vulkanSource, [regex]::Escape($oldVkQueueGuard))).Count
+          if ($queueGuardMatches -ne 4) {
+            throw "Expected four Vulkan global queue-mutex guards, found $queueGuardMatches"
+          }
+          $vulkanSource = $vulkanSource.Replace($oldVkQueueGuard, $legacyVkQueueGuard)
+
           # The shader loader uses a separate per-device std::mutex. Replace it
           # with the compatibility critical section and update all lock sites.
           $oldVkCompileMembers = @'
@@ -1374,7 +1411,7 @@ jobs:
               GGML_ASSERT((VkCommandBuffer) subctx->s->buffer->buf != VK_NULL_HANDLE);
               GGML_ASSERT((VkPipelineLayout) pipeline->layout != VK_NULL_HANDLE);
               GGML_ASSERT((VkPipeline) pipeline->pipeline != VK_NULL_HANDLE);
-              GGML_LOG_INFO("[vulkan-legacy11] dispatch entry: ctx=%p device=%p pipeline=%p name=%s layout=%p pipeline_handle=%p command_buffer=%p descriptor_count=%zu descriptor_index=%zu descriptor_total=%zu elements=%u,%u,%u\n",
+              GGML_LOG_INFO("[vulkan-legacy11] dispatch entry: ctx=%p device=%p pipeline=%p name=%s layout=%p pipeline_handle=%p command_buffer=%p descriptor_count=%zu descriptor_index=%u descriptor_total=%zu elements=%u,%u,%u\n",
                             (void *) ctx,
                             (void *) ctx->device.get(),
                             (void *) pipeline.get(),
@@ -1432,7 +1469,7 @@ jobs:
           $legacyVkDispatchCommands = @'
               vk::DescriptorSet& descriptor_set = ctx->descriptor_sets[ctx->descriptor_set_idx++];
               GGML_ASSERT((VkDescriptorSet) descriptor_set != VK_NULL_HANDLE);
-              GGML_LOG_INFO("[vulkan-legacy11] descriptor set selected: name=%s set=%p index_used=%zu next_index=%zu\n",
+              GGML_LOG_INFO("[vulkan-legacy11] descriptor set selected: name=%s set=%p index_used=%u next_index=%u\n",
                             pipeline->name.c_str(),
                             (void *) (VkDescriptorSet) descriptor_set,
                             ctx->descriptor_set_idx - 1,
@@ -1984,6 +2021,9 @@ jobs:
           "vulkan_per_device_critical_section=enabled" | Add-Content $manifest
           "vulkan_recursive_lock_sites_replaced=6" | Add-Content $manifest
           "vulkan_queue_creation_checkpoints=enabled" | Add-Content $manifest
+          "vulkan_global_queue_srwlock=enabled" | Add-Content $manifest
+          "vulkan_global_queue_lock_sites_replaced=4" | Add-Content $manifest
+          "vulkan_global_queue_lock_checkpoints=enabled" | Add-Content $manifest
           "vulkan_compile_critical_section=enabled" | Add-Content $manifest
           "vulkan_compile_lock_sites_replaced=8" | Add-Content $manifest
           "vulkan_shader_loader_checkpoints=enabled" | Add-Content $manifest
@@ -2046,7 +2086,7 @@ jobs:
           cat > release-notes.md <<'EOF'
           Experimental Windows x64 / Python 3.9 Vulkan compatibility wheel for llama-cpp-python 0.3.34 and legacy Intel Iris Xe driver stacks.
 
-          This build keeps the confirmed GGML and Vulkan-registry SRWLOCK fixes, direct registry-device binding, CPU host-buffer fallback, minimal Intel Xe feature profile, queue-lock compatibility fix, shader compile critical-section fix, r8 shader compatibility switches, r9 cleanup-registry bypass, r10 atomic pipeline completion, and r11 descriptor/dispatch diagnostics. The r11 target log proves descriptor updates, push constants, pipeline binding, descriptor-set binding, and vkCmdDispatch recording all complete. R12 is diagnostic only: it traces return from the dispatched operation and graph builder, command-buffer finalization, queue submission, fence polling/reset, command-buffer reset, and context cleanup.
+          This build keeps the confirmed GGML and Vulkan-registry SRWLOCK fixes, direct registry-device binding, CPU host-buffer fallback, minimal Intel Xe feature profile, per-device queue-lock compatibility fix, shader compile critical-section fix, r8 shader compatibility switches, r9 cleanup-registry bypass, r10 atomic pipeline completion, and r11-r12 command/submission diagnostics. The r12 target log proves command recording and command-buffer finalization complete, then faults before the first queue-submit checkpoint. R13 replaces the intervening process-global std::mutex queue lock with an initialized Windows SRWLOCK at all four guard sites and adds queue-lock checkpoints. It also corrects the diagnostic format for the uint32_t descriptor index.
 
           The GitHub Windows runner validated:
           - wheel packaging and clean Python 3.9 installation
@@ -2062,7 +2102,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: v0.3.34-win39-vulkan-xelegacy-r12
+          RELEASE_TAG: v0.3.34-win39-vulkan-xelegacy-r13
           RELEASE_TARGET: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           mapfile -d '' assets < <(find release-assets -type f -print0)
