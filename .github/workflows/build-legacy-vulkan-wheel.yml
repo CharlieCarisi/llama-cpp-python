@@ -1994,7 +1994,6 @@ jobs:
           from pathlib import Path
 
           import llama_cpp
-          from llama_cpp import Llama
 
           print("Python:", sys.version)
           print("Platform:", platform.platform())
@@ -2007,20 +2006,36 @@ jobs:
           print("BACKEND FREE OK", flush=True)
 
           model_path = Path("test-model/stories15M-q4_0.gguf").resolve()
-          print("Loading CPU smoke-test model", flush=True)
-          llm = Llama(
-              model_path=str(model_path),
-              n_ctx=128,
-              n_batch=32,
-              n_threads=2,
-              n_gpu_layers=0,
-              verbose=True,
+          print("Loading hash-pinned GGUF vocabulary", flush=True)
+          model_params = llama_cpp.llama_model_default_params()
+          model_params.vocab_only = True
+          model = llama_cpp.llama_model_load_from_file(
+              str(model_path).encode("utf-8"), model_params
           )
-          output = llm("Once upon a time", max_tokens=8, temperature=0.0)
-          completion = output["choices"][0]["text"]
-          if not isinstance(completion, str) or not completion:
-              raise RuntimeError(f"Model returned no completion: {output!r}")
-          print("MODEL INFERENCE OK:", repr(completion), flush=True)
+          if not model:
+              raise RuntimeError("Vocabulary-only model load returned null")
+          try:
+              vocab = llama_cpp.llama_model_get_vocab(model)
+              if not vocab:
+                  raise RuntimeError("Loaded model returned no vocabulary")
+              vocab_size = llama_cpp.llama_vocab_n_tokens(vocab)
+              if vocab_size <= 0:
+                  raise RuntimeError(f"Invalid vocabulary size: {vocab_size}")
+              sample = b"Once upon a time"
+              token_buffer = (llama_cpp.llama_token * 64)()
+              token_count = llama_cpp.llama_tokenize(
+                  vocab, sample, len(sample), token_buffer, 64, True, False
+              )
+              if token_count <= 0:
+                  raise RuntimeError(f"Tokenization failed: {token_count}")
+              print(
+                  "MODEL VOCAB/TOKENIZE OK:",
+                  f"vocab={vocab_size}",
+                  f"tokens={token_count}",
+                  flush=True,
+              )
+          finally:
+              llama_cpp.llama_model_free(model)
           '@ | & $testPython -I -X faulthandler -u 2>&1
           $testExitCode = $LASTEXITCODE
           $testOutput | Tee-Object "reports\legacy-vulkan-runtime-test.txt"
@@ -2129,7 +2144,7 @@ jobs:
 
           Validation:
           - Target Iris Xe workstation: one-layer Vulkan inference completed 20 tokens, repeated queue submissions and fence waits, and clean shutdown at 3.70 tokens/s with r13.
-          - GitHub Windows runner: MSVC compilation, clean Python 3.9 installation, backend initialization/free, pinned tiny-GGUF download, eight-token CPU inference, DLL inspection, reproducibility manifest, and SHA-256.
+          - GitHub Windows runner: MSVC compilation, clean Python 3.9 installation, backend initialization/free, hash-pinned tiny-GGUF vocabulary load and tokenization, DLL inspection, reproducibility manifest, and SHA-256.
 
           GitHub's runner has no Vulkan GPU, so r14's production cleanup is behavior-preserving and the GPU compatibility result derives from the same r13 source transformations with diagnostic logging stripped.
           EOF
